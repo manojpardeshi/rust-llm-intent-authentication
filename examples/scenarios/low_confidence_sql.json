@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "How many users?"}],
+  "tool_calls": [{"name": "run_sql", "arguments": {"query": "SELECT count(*) FROM users"}}]
+}

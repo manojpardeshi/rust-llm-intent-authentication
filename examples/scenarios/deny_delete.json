@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "Clean up the old database"}],
+  "tool_calls": [{"name": "delete_db", "arguments": {"name": "prod"}}]
+}

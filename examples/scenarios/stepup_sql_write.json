@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "Remove inactive users"}],
+  "tool_calls": [{"name": "run_sql", "arguments": {"query": "DELETE FROM users WHERE active = false"}}]
+}

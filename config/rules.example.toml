@@ -1,0 +1,67 @@
+# Classifier rules: map tool calls to intents, and flag prompt injection.
+#
+# Tool rules are tried in order; the first whose `name` (exact, `prefix*`, or
+# `*`) and every `args_match` regex match wins. Unmatched tools classify as
+# Unknown with zero confidence, so the LLM fallback (or a policy deny) decides.
+
+# Built-in injection signatures (see DEFAULT_INJECTION_PATTERNS) stay on unless disabled.
+use_default_injection_patterns = true
+
+[[injection]]
+pattern = "(?i)\\b(send|post|upload)\\b.{0,40}\\b(password|api[_ -]?key|secret|token)s?\\b.{0,40}\\bto\\b"
+
+# --- Reads -----------------------------------------------------------------
+
+[[tool]]
+name = "read_file"
+category = "ReadData"
+resource_arg = "path"
+
+[[tool]]
+name = "search_*"
+category = "ReadData"
+confidence = 0.9
+
+# Writes take precedence over reads for the same tool, so list them first.
+[[tool]]
+name = "run_sql"
+category = "WriteData"
+action = "sql_write"
+args_match = { query = "(?i)^\\s*(insert|update|delete|drop|alter|truncate|create)\\b" }
+
+[[tool]]
+name = "run_sql"
+category = "ReadData"
+action = "sql_read"
+# Not every non-write SQL is a pure read; let the LLM confirm.
+confidence = 0.7
+
+# --- Writes ----------------------------------------------------------------
+
+[[tool]]
+name = "write_file"
+category = "WriteData"
+resource_arg = "path"
+
+[[tool]]
+name = "delete_*"
+category = "WriteData"
+
+# --- Side effects ----------------------------------------------------------
+
+[[tool]]
+name = "send_email"
+category = "SendMessage"
+resource_arg = "to"
+
+[[tool]]
+name = "run_shell"
+category = "ExecuteCode"
+
+[[tool]]
+name = "transfer_funds"
+category = "Financial"
+
+[[tool]]
+name = "update_iam_*"
+category = "AdminConfig"

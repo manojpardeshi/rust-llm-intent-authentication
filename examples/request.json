@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "Summarise /srv/report.txt"}],
+  "tool_calls": [{"name": "read_file", "arguments": {"path": "/srv/report.txt"}}]
+}

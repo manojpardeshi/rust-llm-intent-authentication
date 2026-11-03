@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "Launch it"}],
+  "tool_calls": [{"name": "launch_rocket", "arguments": {}}]
+}

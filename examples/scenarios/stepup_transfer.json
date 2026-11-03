@@ -1,0 +1,6 @@
+{
+  "subject": "user-42",
+  "session_id": "sess-1",
+  "messages": [{"role": "user", "content": "Pay the invoice"}],
+  "tool_calls": [{"name": "transfer_funds", "arguments": {"to": "ACME", "amount": 1200}}]
+}
