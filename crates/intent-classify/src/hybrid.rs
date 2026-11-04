@@ -50,15 +50,22 @@ impl IntentClassifier for HybridClassifier {
             return Ok(ruled);
         };
 
-        // TODO(phase 6): emit the fallback error as an audit/tracing event.
-        let Ok(mut llm) = fallback.classify(request).await else {
-            return Ok(Intent {
-                category: IntentCategory::Unknown,
-                action: "classification_failed".into(),
-                resource: None,
-                confidence: 0.0,
-                source: ClassifierSource::Hybrid,
-            });
+        let mut llm = match fallback.classify(request).await {
+            Ok(llm) => llm,
+            Err(e) => {
+                tracing::warn!(
+                    target: "intent::audit",
+                    error = %e,
+                    "fallback classifier failed; failing closed"
+                );
+                return Ok(Intent {
+                    category: IntentCategory::Unknown,
+                    action: "classification_failed".into(),
+                    resource: None,
+                    confidence: 0.0,
+                    source: ClassifierSource::Hybrid,
+                });
+            }
         };
         llm.confidence = llm.confidence.clamp(0.0, 1.0);
 

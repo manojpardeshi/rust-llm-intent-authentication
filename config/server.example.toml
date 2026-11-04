@@ -1,0 +1,24 @@
+# intent-server configuration. Run with: intent-server --config config/server.example.toml
+#
+# API keys are NOT configured here (unknown fields are rejected). Provide them
+# via the environment as a comma-separated list; only SHA-256 digests are kept:
+#   INTENT_API_KEYS="key-one,key-two"
+
+bind = "127.0.0.1:8080"
+key_path = "signing.key.json"
+policy_path = "config/policy.example.toml"
+rules_path = "config/rules.example.toml"
+issuer = "intent-server"
+audience = "tool-gateway"
+
+# Rule confidence at/above which the LLM fallback is skipped (default 0.85).
+# threshold = 0.85
+
+# Use Claude (ANTHROPIC_API_KEY) as fallback for low-confidence rule results.
+llm = false
+
+# Maximum request body size in bytes (default 256 KiB).
+max_body_bytes = 262144
+
+# DANGEROUS: allow starting with no API keys configured. Dev only.
+allow_unauthenticated = false
