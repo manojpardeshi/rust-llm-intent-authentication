@@ -292,25 +292,6 @@ struct VerifyError {
     error: &'static str,
 }
 
-/// Short, token-free error category for a verification failure.
-fn verify_error_category(e: &TokenError) -> &'static str {
-    use jsonwebtoken::errors::ErrorKind;
-    match e {
-        TokenError::Jwt(j) => match j.kind() {
-            ErrorKind::ExpiredSignature => "expired",
-            ErrorKind::ImmatureSignature => "not_yet_valid",
-            ErrorKind::InvalidSignature => "bad_signature",
-            ErrorKind::InvalidIssuer => "wrong_issuer",
-            ErrorKind::InvalidAudience => "wrong_audience",
-            _ => "malformed_token",
-        },
-        TokenError::MissingKid | TokenError::UnknownKey(_) => "unknown_key",
-        TokenError::MissingScope(_) => "missing_scope",
-        TokenError::RequestMismatch => "request_mismatch",
-        TokenError::Digest(_) | TokenError::Key(_) | TokenError::NotAllowed => "invalid_token",
-    }
-}
-
 async fn verify(State(state): State<AppState>, Json(req): Json<VerifyRequest>) -> Response {
     match state
         .verifier
@@ -330,7 +311,7 @@ async fn verify(State(state): State<AppState>, Json(req): Json<VerifyRequest>) -
             Json(json!({"valid": true, "claims": claims})).into_response()
         }
         Err(e) => {
-            let error = verify_error_category(&e);
+            let error = e.category();
             tracing::info!(target: "intent::audit", result = "invalid", error, "verify");
             if let Some(m) = &state.metrics {
                 m.record_verification("invalid");

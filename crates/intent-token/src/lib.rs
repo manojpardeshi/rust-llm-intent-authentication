@@ -42,6 +42,28 @@ pub enum TokenError {
     RequestMismatch,
 }
 
+impl TokenError {
+    /// Short, token-free category for a verification failure, suitable for
+    /// API responses and logs.
+    pub fn category(&self) -> &'static str {
+        use jsonwebtoken::errors::ErrorKind;
+        match self {
+            Self::Jwt(j) => match j.kind() {
+                ErrorKind::ExpiredSignature => "expired",
+                ErrorKind::ImmatureSignature => "not_yet_valid",
+                ErrorKind::InvalidSignature => "bad_signature",
+                ErrorKind::InvalidIssuer => "wrong_issuer",
+                ErrorKind::InvalidAudience => "wrong_audience",
+                _ => "malformed_token",
+            },
+            Self::MissingKid | Self::UnknownKey(_) => "unknown_key",
+            Self::MissingScope(_) => "missing_scope",
+            Self::RequestMismatch => "request_mismatch",
+            Self::Digest(_) | Self::Key(_) | Self::NotAllowed => "invalid_token",
+        }
+    }
+}
+
 /// The `intent` claim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntentClaim {

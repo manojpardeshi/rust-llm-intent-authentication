@@ -19,7 +19,6 @@ intent-classify = { version = "0.1.0", path = "../intent-classify" }
 intent-core = { version = "0.1.0", path = "../intent-core" }
 intent-policy = { version = "0.1.0", path = "../intent-policy" }
 intent-token = { version = "0.1.0", path = "../intent-token" }
-jsonwebtoken = { version = "11.1.0", default-features = false }
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 serde = { version = "1.0.229", features = ["derive"] }
