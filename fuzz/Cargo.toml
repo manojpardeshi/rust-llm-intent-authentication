@@ -1,0 +1,56 @@
+[package]
+name = "intent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+intent-classify = { path = "../crates/intent-classify" }
+intent-core = { path = "../crates/intent-core" }
+intent-policy = { path = "../crates/intent-policy" }
+intent-token = { path = "../crates/intent-token" }
+serde_json = "1.0.154"
+
+# Separate workspace: the fuzz crate is not a member of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "digest"
+path = "fuzz_targets/digest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_json"
+path = "fuzz_targets/request_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_toml"
+path = "fuzz_targets/policy_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules_classify"
+path = "fuzz_targets/rules_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_verify"
+path = "fuzz_targets/token_verify.rs"
+test = false
+doc = false
+bench = false

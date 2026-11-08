@@ -405,3 +405,200 @@ mod tests {
         assert_eq!(serde_json::from_value::<Decision>(v).unwrap(), d);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::Value;
+
+    /// Arbitrary JSON values, including nested objects and arrays.
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(Value::from),
+            "[ -~]{0,8}".prop_map(Value::String),
+            any::<String>().prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-z]{1,3}", inner, 0..4)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn tool_calls() -> impl Strategy<Value = Vec<ToolCall>> {
+        prop::collection::vec(
+            ("[a-z_]{1,8}", json_value())
+                .prop_map(|(name, arguments)| ToolCall { name, arguments }),
+            0..4,
+        )
+    }
+
+    /// FNV-1a over the key, perturbed by `seed`: gives a seed-dependent order.
+    fn key_rank(key: &str, seed: u64) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+        for b in key.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Renders `v` as JSON text with object members in a seed-dependent order.
+    fn render(v: &Value, seed: u64) -> String {
+        match v {
+            Value::Object(map) => {
+                let mut members: Vec<_> = map.iter().collect();
+                members.sort_by_key(|(k, _)| key_rank(k, seed));
+                let body: Vec<String> = members
+                    .iter()
+                    .map(|(k, x)| {
+                        format!("{}:{}", serde_json::to_string(k).unwrap(), render(x, seed))
+                    })
+                    .collect();
+                format!("{{{}}}", body.join(","))
+            }
+            Value::Array(items) => {
+                let body: Vec<String> = items.iter().map(|x| render(x, seed)).collect();
+                format!("[{}]", body.join(","))
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn calls_text(calls: &[ToolCall], seed: u64) -> String {
+        let items: Vec<String> = calls
+            .iter()
+            .map(|c| {
+                format!(
+                    "{{\"name\":{},\"arguments\":{}}}",
+                    serde_json::to_string(&c.name).unwrap(),
+                    render(&c.arguments, seed)
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    fn count_strings(v: &Value) -> usize {
+        match v {
+            Value::String(_) => 1,
+            Value::Array(a) => a.iter().map(count_strings).sum(),
+            Value::Object(o) => o.values().map(count_strings).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Appends a marker to the `target`-th string value (depth-first).
+    fn mutate_string(v: &mut Value, target: &mut usize) -> bool {
+        match v {
+            Value::String(s) => {
+                if *target == 0 {
+                    s.push('\u{1}');
+                    true
+                } else {
+                    *target -= 1;
+                    false
+                }
+            }
+            Value::Array(a) => a.iter_mut().any(|x| mutate_string(x, target)),
+            Value::Object(o) => o.values_mut().any(|x| mutate_string(x, target)),
+            _ => false,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn digest_ignores_object_key_order(
+            calls in tool_calls(),
+            s1 in any::<u64>(),
+            s2 in any::<u64>(),
+        ) {
+            let a: Vec<ToolCall> = serde_json::from_str(&calls_text(&calls, s1)).unwrap();
+            let b: Vec<ToolCall> = serde_json::from_str(&calls_text(&calls, s2)).unwrap();
+            prop_assert_eq!(tool_calls_digest(&a).unwrap(), tool_calls_digest(&b).unwrap());
+            prop_assert_eq!(
+                tool_calls_digest(&a).unwrap(),
+                tool_calls_digest(&calls).unwrap()
+            );
+        }
+
+        #[test]
+        fn digest_ignores_insertion_order_of_shuffled_pairs(
+            pairs in prop::collection::btree_map("[a-z]{1,4}", json_value(), 0..6)
+                .prop_map(|m| m.into_iter().collect::<Vec<_>>())
+                .prop_shuffle(),
+            nested in json_value(),
+        ) {
+            let mut forward = serde_json::Map::new();
+            for (k, v) in &pairs {
+                forward.insert(k.clone(), v.clone());
+            }
+            let mut shuffled = serde_json::Map::new();
+            for (k, v) in pairs.iter().rev() {
+                shuffled.insert(k.clone(), v.clone());
+            }
+            let mut outer_a = serde_json::Map::new();
+            outer_a.insert("args".into(), Value::Object(forward));
+            outer_a.insert("nested".into(), nested.clone());
+            let mut outer_b = serde_json::Map::new();
+            outer_b.insert("nested".into(), nested);
+            outer_b.insert("args".into(), Value::Object(shuffled));
+            let call = |args: Value| vec![ToolCall { name: "t".into(), arguments: args }];
+            prop_assert_eq!(
+                tool_calls_digest(&call(Value::Object(outer_a))).unwrap(),
+                tool_calls_digest(&call(Value::Object(outer_b))).unwrap()
+            );
+        }
+
+        #[test]
+        fn digest_changes_when_any_string_value_changes(
+            calls in tool_calls(),
+            pick in any::<usize>(),
+        ) {
+            let total: usize = calls.iter().map(|c| count_strings(&c.arguments)).sum();
+            prop_assume!(total > 0);
+            let mut idx = pick % total;
+            let mut mutated = calls.clone();
+            for call in &mut mutated {
+                let n = count_strings(&call.arguments);
+                if idx < n {
+                    prop_assert!(mutate_string(&mut call.arguments, &mut idx));
+                    break;
+                }
+                idx -= n;
+            }
+            prop_assert_ne!(
+                tool_calls_digest(&calls).unwrap(),
+                tool_calls_digest(&mutated).unwrap()
+            );
+        }
+
+        #[test]
+        fn glob_star_matches_everything(value in any::<String>()) {
+            prop_assert!(glob_match("*", &value));
+        }
+
+        #[test]
+        fn glob_exact_pattern_matches_itself(pattern in any::<String>()) {
+            prop_assert!(glob_match(&pattern, &pattern));
+        }
+
+        #[test]
+        fn glob_prefix_pattern_matches_prefix_plus_anything(
+            prefix in any::<String>(),
+            rest in any::<String>(),
+        ) {
+            let pattern = format!("{prefix}*");
+            let value = format!("{prefix}{rest}");
+            prop_assert!(glob_match(&pattern, &value));
+        }
+    }
+}
