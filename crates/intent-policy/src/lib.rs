@@ -172,12 +172,15 @@ impl PolicyEngine for Policy {
             .iter()
             .find(|r| Self::matches(r, request, intent))
         {
-            Some(rule) if intent.confidence < rule.min_confidence => Decision::Deny {
-                reason: format!(
-                    "intent confidence {:.2} below required {:.2}",
-                    intent.confidence, rule.min_confidence
-                ),
-            },
+            // A NaN confidence counts as below the bar (fails closed).
+            Some(rule) if intent.confidence.is_nan() || intent.confidence < rule.min_confidence => {
+                Decision::Deny {
+                    reason: format!(
+                        "intent confidence {:.2} below required {:.2}",
+                        intent.confidence, rule.min_confidence
+                    ),
+                }
+            }
             Some(rule) => Self::to_decision(rule.decision, Some(rule), rule.reason.as_deref()),
             None => Self::to_decision(self.default.decision, None, self.default.reason.as_deref()),
         }
@@ -263,6 +266,15 @@ mod tests {
             &intent(IntentCategory::ReadData, "read_file", 0.5),
         );
         assert!(matches!(d, Decision::Deny { reason } if reason.contains("confidence")));
+    }
+
+    #[test]
+    fn nan_confidence_fails_closed() {
+        let d = policy().decide(
+            &req("alice"),
+            &intent(IntentCategory::ReadData, "read_file", f32::NAN),
+        );
+        assert!(matches!(d, Decision::Deny { .. }));
     }
 
     #[test]

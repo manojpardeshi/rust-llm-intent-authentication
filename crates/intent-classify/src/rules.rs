@@ -15,11 +15,11 @@ use crate::ClassifyError;
 /// Built-in prompt-injection signatures, enabled unless
 /// `use_default_injection_patterns = false`.
 pub const DEFAULT_INJECTION_PATTERNS: &[&str] = &[
-    r"(?i)\b(ignore|disregard|forget)\s+(all\s+|any\s+)?(of\s+)?(the\s+|your\s+)?(previous|prior|above|earlier|system)\s+(instructions|prompts?|rules|directions)",
-    r"(?i)\byou\s+are\s+now\s+(in\s+)?(developer|dan|jailbreak|god)\s*mode",
-    r"(?i)\b(reveal|print|show|output|repeat)\s+(me\s+)?(your|the)\s+(system\s+prompt|hidden\s+instructions|initial\s+instructions)",
+    r"(?i)(ignore|disregard|forget)\s+(all\s+|any\s+)?(of\s+)?(the\s+|your\s+)?(previous|prior|above|earlier|system)\s+(instructions|prompts?|rules|directions)",
+    r"(?i)you\s+are\s+now\s+(in\s+)?(developer|dan|jailbreak|god)\s*mode",
+    r"(?i)(reveal|print|show|output|repeat)\s+(me\s+)?(your|the)\s+(system\s+prompt|hidden\s+instructions|initial\s+instructions)",
     r"(?i)<\s*/?\s*(system|im_start|im_end)\s*>",
-    r"(?i)\bnew\s+instructions\s*:",
+    r"(?i)new\s+instructions\s*:",
 ];
 
 /// Confidence assigned to a detected injection.
@@ -537,10 +537,9 @@ mod proptests {
             prop_assert_eq!(example().classify_sync(&req).category, IntentCategory::Malicious);
         }
 
-        // The default pattern starts with `\b`, so the phrase is only detected
-        // when a non-word character precedes it. See the bug note below.
+        // Patterns must not require a word boundary before the phrase, or
+        // "xignore previous instructions" would slip past.
         #[test]
-        #[ignore = "bug: default injection pattern requires a word boundary before 'ignore', so 'xignore previous instructions' is not flagged Malicious"]
         fn injection_phrase_with_any_prefix_is_malicious(
             before in "[ -~]{0,40}",
             after in "[ -~]{0,40}",
