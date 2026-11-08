@@ -127,6 +127,8 @@ pub struct JwtIssuer {
     kid: String,
     encoding_key: EncodingKey,
     jwk: Jwk,
+    /// Verification-only public keys of rotated-out signing keys.
+    retired: Vec<Jwk>,
 }
 
 impl JwtIssuer {
@@ -136,14 +138,46 @@ impl JwtIssuer {
             kid: key.kid().to_owned(),
             encoding_key: EncodingKey::from_ed_der(&key.pkcs8_der()?),
             jwk: key.public_jwk(),
+            retired: Vec::new(),
         })
     }
 
-    /// Public keys for verifiers.
-    pub fn jwks(&self) -> Jwks {
-        Jwks {
-            keys: vec![self.jwk.clone()],
+    /// Publishes extra verification-only public keys (rotated-out signing
+    /// keys) so tokens signed by them stay verifiable. Signing always uses the
+    /// active key. Duplicate kids are collapsed; a kid equal to the active
+    /// kid, or a non-Ed25519 key, is rejected.
+    pub fn with_retired_keys(mut self, keys: Vec<Jwk>) -> Result<Self, TokenError> {
+        for jwk in keys {
+            if jwk.kty != "OKP" || jwk.crv != "Ed25519" || jwk.alg != "EdDSA" {
+                return Err(TokenError::Key(format!(
+                    "retired key {:?} is not an Ed25519/EdDSA key",
+                    jwk.kid
+                )));
+            }
+            if jwk.kid == self.kid {
+                return Err(TokenError::Key(
+                    "retired key has the same kid as the active signing key".into(),
+                ));
+            }
+            // Validate the public key encoding up front.
+            DecodingKey::from_ed_components(&jwk.x)?;
+            if !self.retired.iter().any(|k| k.kid == jwk.kid) {
+                self.retired.push(jwk);
+            }
         }
+        Ok(self)
+    }
+
+    /// The active `kid` used for signing.
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// Public keys for verifiers: the active key first, then retired keys.
+    pub fn jwks(&self) -> Jwks {
+        let mut keys = vec![self.jwk.clone()];
+        keys.extend(self.retired.iter().cloned());
+        Jwks { keys }
     }
 
     fn sign(&self, claims: &Claims) -> Result<String, TokenError> {
@@ -473,5 +507,56 @@ mod tests {
             .encode(format!(r#"{{"alg":"none","kid":"{}"}}"#, issuer.kid));
         let unsigned = format!("{header}.{payload}.");
         assert!(verifier.verify(&unsigned, &req.tool_calls, None).is_err());
+    }
+
+    #[test]
+    fn retired_keys_verify_old_tokens_and_new_tokens_use_new_kid() {
+        let old_key = KeyPair::generate().unwrap();
+        let old_issuer = JwtIssuer::new(IssuerConfig::new(ISS, AUD), &old_key).unwrap();
+        let req = request();
+        let old_token = old_issuer.issue(&req, &intent(), &allow(60)).unwrap();
+
+        let new_key = KeyPair::generate().unwrap();
+        let new_issuer = JwtIssuer::new(IssuerConfig::new(ISS, AUD), &new_key)
+            .unwrap()
+            .with_retired_keys(vec![old_key.public_jwk()])
+            .unwrap();
+        let jwks = new_issuer.jwks();
+        assert_eq!(
+            jwks.keys.iter().map(|k| k.kid.as_str()).collect::<Vec<_>>(),
+            vec![new_key.kid(), old_key.kid()]
+        );
+
+        let verifier = TokenVerifier::from_jwks(&jwks, ISS, AUD).unwrap();
+        verifier
+            .verify(&old_token.token, &req.tool_calls, None)
+            .unwrap();
+
+        let new_token = new_issuer.issue(&req, &intent(), &allow(60)).unwrap();
+        let header = jsonwebtoken::decode_header(&new_token.token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some(new_key.kid()));
+        verifier
+            .verify(&new_token.token, &req.tool_calls, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn retired_keys_are_validated() {
+        let key = KeyPair::generate().unwrap();
+        let mk = || JwtIssuer::new(IssuerConfig::new(ISS, AUD), &key).unwrap();
+        // Same kid as the active key.
+        assert!(mk().with_retired_keys(vec![key.public_jwk()]).is_err());
+        // Wrong key type.
+        let mut rsa = KeyPair::generate().unwrap().public_jwk();
+        rsa.kty = "RSA".into();
+        assert!(mk().with_retired_keys(vec![rsa]).is_err());
+        // Malformed x.
+        let mut bad = KeyPair::generate().unwrap().public_jwk();
+        bad.x = "!!!".into();
+        assert!(mk().with_retired_keys(vec![bad]).is_err());
+        // Duplicates collapse.
+        let old = KeyPair::generate().unwrap().public_jwk();
+        let issuer = mk().with_retired_keys(vec![old.clone(), old]).unwrap();
+        assert_eq!(issuer.jwks().keys.len(), 2);
     }
 }

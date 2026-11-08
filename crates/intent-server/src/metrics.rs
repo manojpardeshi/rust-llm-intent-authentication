@@ -50,6 +50,18 @@ impl Metrics {
         });
     }
 
+    pub fn record_reload(&self, result: &'static str) {
+        metrics::with_local_recorder(&*self.recorder, || {
+            counter!("intent_reloads_total", "result" => result).increment(1);
+        });
+    }
+
+    pub fn record_rate_limited(&self) {
+        metrics::with_local_recorder(&*self.recorder, || {
+            counter!("intent_rate_limited_total").increment(1);
+        });
+    }
+
     /// Prometheus text exposition.
     pub fn render(&self) -> String {
         self.handle.render()

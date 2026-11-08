@@ -37,11 +37,15 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!(bind = %config.bind, "intent-server listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
+    let _reload = intent_server::spawn_reload_triggers(&state)?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    })
+    .await?;
     Ok(())
 }
