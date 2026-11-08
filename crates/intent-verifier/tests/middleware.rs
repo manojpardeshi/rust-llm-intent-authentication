@@ -7,7 +7,11 @@ use axum::routing::post;
 use common::*;
 use http_body_util::BodyExt as _;
 use intent_token::KeyPair;
-use intent_verifier::{IntentLayer, VerifiedIntent, VerifiedToolCalls, Verifier};
+use std::sync::Arc;
+
+use intent_verifier::{
+    InMemoryReplayStore, IntentLayer, VerifiedIntent, VerifiedToolCalls, Verifier,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -196,4 +200,39 @@ async fn handler_sees_verified_tool_calls() {
     let (status, json, _) = send(&app, Some(&token), single()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json, serde_json::to_value(calls()).unwrap());
+}
+
+fn replay_app(key: &KeyPair, capacity: usize) -> Router {
+    let v = Verifier::from_jwks(&jwks(key), ISS, AUD)
+        .unwrap()
+        .with_replay_store(Arc::new(InMemoryReplayStore::new(capacity)));
+    Router::new().route(
+        "/tools/run",
+        post(|| async { "ok" }).layer(IntentLayer::new(v)),
+    )
+}
+
+#[tokio::test]
+async fn replayed_token_is_401() {
+    let key = KeyPair::generate().unwrap();
+    let app = replay_app(&key, 10);
+    let token = mint(&key, &["data:read"]);
+    let (status, _, _) = send(&app, Some(&token), single()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, json, headers) = send(&app, Some(&token), single()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json["error"], "replayed");
+    assert!(headers.contains_key(header::WWW_AUTHENTICATE));
+}
+
+#[tokio::test]
+async fn full_replay_store_is_503() {
+    let key = KeyPair::generate().unwrap();
+    let app = replay_app(&key, 1);
+    let (status, _, _) = send(&app, Some(&mint(&key, &["data:read"])), single()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, json, headers) = send(&app, Some(&mint(&key, &["data:read"])), single()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json["error"], "replay_store_unavailable");
+    assert_eq!(headers[header::RETRY_AFTER], "1");
 }

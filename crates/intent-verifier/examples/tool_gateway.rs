@@ -6,13 +6,15 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use axum::routing::post;
 use axum::{Json, Router};
 use intent_server::{ApiKeys, AppState, ServerConfig, router};
 use intent_token::KeyPair;
 use intent_verifier::{
-    IntentLayer, RemoteJwksOptions, VerifiedIntent, VerifiedToolCalls, Verifier,
+    InMemoryReplayStore, IntentLayer, RemoteJwksOptions, VerifiedIntent, VerifiedToolCalls,
+    Verifier,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -82,7 +84,9 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         &config.audience,
         RemoteJwksOptions::default(),
     )
-    .await?;
+    .await?
+    // Tokens are single-use at this gateway.
+    .with_replay_store(Arc::new(InMemoryReplayStore::default()));
     let gateway_app = Router::new().route(
         "/tools/read_file",
         post(read_file).layer(IntentLayer::new(verifier).require_scope("data:read")),
@@ -150,6 +154,20 @@ async fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "gateway, tampered args",
         format!("{status} {}", body["error"].as_str().unwrap_or("")),
         "401 Unauthorized request_mismatch",
+    );
+
+    let res = client
+        .post(&gateway_url)
+        .bearer_auth(&token)
+        .json(&call)
+        .send()
+        .await?;
+    let status = res.status();
+    let body: Value = res.json().await?;
+    check(
+        "gateway, same token re-sent",
+        format!("{status} {}", body["error"].as_str().unwrap_or("")),
+        "401 Unauthorized replayed",
     );
 
     let res = client.post(&gateway_url).json(&call).send().await?;

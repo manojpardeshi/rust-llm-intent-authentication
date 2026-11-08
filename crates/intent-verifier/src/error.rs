@@ -1,5 +1,7 @@
 use intent_token::TokenError;
 
+use crate::ReplayError;
+
 /// Errors from building or using a [`crate::Verifier`].
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
@@ -12,6 +14,10 @@ pub enum VerifyError {
     /// The token (or the request it is presented with) was rejected.
     #[error(transparent)]
     Token(#[from] TokenError),
+    /// The token is valid but was already used, or the replay store could not
+    /// record it (fail closed).
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
 }
 
 impl VerifyError {
@@ -19,6 +25,8 @@ impl VerifyError {
     pub fn category(&self) -> &'static str {
         match self {
             Self::Token(e) => e.category(),
+            Self::Replay(ReplayError::Replayed) => "replayed",
+            Self::Replay(ReplayError::Full | ReplayError::Backend(_)) => "replay_store_unavailable",
             Self::Config(_) | Self::Fetch(_) => "invalid_token",
         }
     }

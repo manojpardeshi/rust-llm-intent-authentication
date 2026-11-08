@@ -16,7 +16,7 @@ use intent_token::Claims;
 use serde_json::{Value, json};
 use tower::{Layer, Service};
 
-use crate::Verifier;
+use crate::{ReplayError, Verifier, VerifyError};
 
 const DEFAULT_MAX_BODY: usize = 256 * 1024;
 const INTENT_TOKEN_HEADER: &str = "x-intent-token";
@@ -169,6 +169,10 @@ async fn authorize(cfg: &IntentLayer, req: Request<Body>) -> Result<Request<Body
         }
         Err(e) => {
             let error = e.category();
+            if let VerifyError::Replay(ReplayError::Full | ReplayError::Backend(_)) = &e {
+                tracing::error!(target: "intent::gateway", result = "unavailable", error, detail = %e, "replay store unavailable; failing closed");
+                return Err(Box::new(reject(Failure::Unavailable(error))));
+            }
             tracing::info!(target: "intent::gateway", result = "invalid", error, "intent token rejected");
             Err(Box::new(reject(Failure::Unauthorized(error))))
         }
@@ -241,6 +245,7 @@ enum Failure {
     Unauthorized(&'static str),
     BadRequest(&'static str),
     TooLarge,
+    Unavailable(&'static str),
 }
 
 fn reject(f: Failure) -> Response {
@@ -255,6 +260,16 @@ fn reject(f: Failure) -> Response {
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static(r#"Bearer error="invalid_token""#),
             );
+            res
+        }
+        Failure::Unavailable(error) => {
+            let mut res = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": error})),
+            )
+                .into_response();
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             res
         }
         Failure::BadRequest(msg) => {

@@ -4,9 +4,21 @@
 //! JWKS (static or fetched and refreshed over HTTP) and that the tool calls
 //! being executed are exactly those the token was issued for. With the `axum`
 //! feature (default), [`IntentLayer`] wires this into an axum router.
+//!
+//! # Single-use tokens
+//!
+//! Tokens are bearer credentials valid until `exp`. Install a
+//! [`ReplayStore`] with [`Verifier::with_replay_store`] to make each token
+//! (identified by `jti`) usable once. The id is consumed only after the
+//! signature, claims, scope and request binding all pass, so a forged or
+//! mismatched request cannot burn a legitimate token. If the store is full or
+//! unavailable, verification fails closed. Without a store, tokens may be
+//! reused until they expire. [`InMemoryReplayStore`] is per-process; run
+//! several gateway instances against a shared [`ReplayStore`] implementation.
 
 mod error;
 mod remote;
+mod replay;
 
 #[cfg(feature = "axum")]
 mod middleware;
@@ -20,6 +32,7 @@ use tokio::sync::Mutex;
 
 pub use error::VerifyError;
 pub use remote::RemoteJwksOptions;
+pub use replay::{InMemoryReplayStore, ReplayError, ReplayStore};
 
 #[cfg(feature = "axum")]
 pub use middleware::{IntentLayer, IntentService, VerifiedIntent, VerifiedToolCalls};
@@ -28,6 +41,7 @@ pub use middleware::{IntentLayer, IntentService, VerifiedIntent, VerifiedToolCal
 #[derive(Clone)]
 pub struct Verifier {
     inner: Arc<Inner>,
+    replay: Option<Arc<dyn ReplayStore>>,
 }
 
 enum Inner {
@@ -60,6 +74,7 @@ impl Verifier {
             .map_err(|e| VerifyError::Config(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(Inner::Static(verifier)),
+            replay: None,
         })
     }
 
@@ -92,21 +107,36 @@ impl Verifier {
                 }),
                 refresh: Mutex::new(()),
             })),
+            replay: None,
         })
     }
 
+    /// Makes tokens single-use: each `jti` is recorded in `store` on its first
+    /// successful verification and later presentations fail with
+    /// [`VerifyError::Replay`]. Clones of the verifier share the store.
+    pub fn with_replay_store(mut self, store: Arc<dyn ReplayStore>) -> Self {
+        self.replay = Some(store);
+        self
+    }
+
     /// Verifies signature, standard claims, an optional required scope, and
-    /// that `tool_calls` are exactly what the token was issued for.
+    /// that `tool_calls` are exactly what the token was issued for. With a
+    /// replay store, also consumes the token's `jti` (last, after all other
+    /// checks pass).
     pub async fn verify(
         &self,
         token: &str,
         tool_calls: &[ToolCall],
         required_scope: Option<&str>,
     ) -> Result<Claims, VerifyError> {
-        match &*self.inner {
-            Inner::Static(v) => Ok(v.verify(token, tool_calls, required_scope)?),
-            Inner::Remote(r) => r.verify(token, tool_calls, required_scope).await,
+        let claims = match &*self.inner {
+            Inner::Static(v) => v.verify(token, tool_calls, required_scope)?,
+            Inner::Remote(r) => r.verify(token, tool_calls, required_scope).await?,
+        };
+        if let Some(store) = &self.replay {
+            store.check_and_insert(&claims.jti, claims.exp)?;
         }
+        Ok(claims)
     }
 }
 
