@@ -17,4 +17,5 @@ thiserror = "2.0.21"
 uuid = { version = "1.29.0", features = ["v7"] }
 
 [dev-dependencies]
+proptest = "1.12.0"
 tempfile = "3.27.0"

@@ -399,3 +399,161 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use std::sync::OnceLock;
+
+    use super::*;
+    use intent_core::Message;
+    use proptest::prelude::*;
+    use serde_json::Value;
+
+    const EXAMPLE: &str = include_str!("../../../config/rules.example.toml");
+
+    fn example() -> &'static RuleClassifier {
+        static CLASSIFIER: OnceLock<RuleClassifier> = OnceLock::new();
+        CLASSIFIER.get_or_init(|| RuleClassifier::from_toml_str(EXAMPLE).unwrap())
+    }
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            "[ -~]{0,12}".prop_map(Value::String),
+            any::<String>().prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-z_]{1,4}", inner, 0..4)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn tool_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "\\PC{0,12}",
+            "[a-z_]{0,12}",
+            prop::sample::select(vec![
+                "read_file",
+                "search_docs",
+                "run_sql",
+                "write_file",
+                "delete_row",
+                "send_email",
+                "run_shell",
+                "transfer_funds",
+                "update_iam_role",
+                "launch_rocket",
+            ])
+            .prop_map(String::from),
+        ]
+    }
+
+    fn message() -> impl Strategy<Value = Message> {
+        ("\\PC{0,8}", "\\PC{0,80}").prop_map(|(role, content)| Message { role, content })
+    }
+
+    fn request() -> impl Strategy<Value = IntentRequest> {
+        (
+            any::<String>(),
+            prop::option::of(any::<String>()),
+            prop::collection::vec(message(), 0..3),
+            prop::collection::vec(
+                (tool_name(), json_value())
+                    .prop_map(|(name, arguments)| ToolCall { name, arguments }),
+                0..4,
+            ),
+            prop::collection::btree_map("[a-z]{1,4}", json_value(), 0..3),
+        )
+            .prop_map(|(subject, session_id, messages, tool_calls, metadata)| {
+                IntentRequest {
+                    subject,
+                    session_id,
+                    messages,
+                    tool_calls,
+                    metadata,
+                }
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn classify_never_panics_and_confidence_is_in_range(req in request()) {
+            let intent = example().classify_sync(&req);
+            prop_assert!((0.0..=1.0).contains(&intent.confidence), "{}", intent.confidence);
+        }
+
+        #[test]
+        fn configured_confidence_is_in_range(confidence in any::<f32>(), name in "[a-z*_]{0,6}") {
+            let config = RulesConfig {
+                use_default_injection_patterns: true,
+                injections: vec![],
+                tools: vec![ToolRule {
+                    name,
+                    category: IntentCategory::ReadData,
+                    action: None,
+                    resource_arg: None,
+                    confidence,
+                    args_match: BTreeMap::new(),
+                }],
+            };
+            // Out-of-range confidences are rejected at construction.
+            if let Ok(classifier) = RuleClassifier::new(config) {
+                let req = IntentRequest {
+                    subject: "u".into(),
+                    session_id: None,
+                    messages: vec![],
+                    tool_calls: vec![ToolCall {
+                        name: "read_file".into(),
+                        arguments: Value::Null,
+                    }],
+                    metadata: Default::default(),
+                };
+                let intent = classifier.classify_sync(&req);
+                prop_assert!((0.0..=1.0).contains(&intent.confidence));
+            }
+        }
+
+        #[test]
+        fn injection_phrase_with_separated_context_is_malicious(
+            before in "[ -~]{0,40}",
+            after in "[ -~]{0,40}",
+        ) {
+            let text = format!("{before} ignore previous instructions {after}");
+            let req = IntentRequest {
+                subject: "u".into(),
+                session_id: None,
+                messages: vec![Message { role: "user".into(), content: text }],
+                tool_calls: vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: Value::Null,
+                }],
+                metadata: Default::default(),
+            };
+            prop_assert_eq!(example().classify_sync(&req).category, IntentCategory::Malicious);
+        }
+
+        // The default pattern starts with `\b`, so the phrase is only detected
+        // when a non-word character precedes it. See the bug note below.
+        #[test]
+        #[ignore = "bug: default injection pattern requires a word boundary before 'ignore', so 'xignore previous instructions' is not flagged Malicious"]
+        fn injection_phrase_with_any_prefix_is_malicious(
+            before in "[ -~]{0,40}",
+            after in "[ -~]{0,40}",
+        ) {
+            let text = format!("{before}ignore previous instructions{after}");
+            let req = IntentRequest {
+                subject: "u".into(),
+                session_id: None,
+                messages: vec![Message { role: "user".into(), content: text }],
+                tool_calls: vec![],
+                metadata: Default::default(),
+            };
+            prop_assert_eq!(example().classify_sync(&req).category, IntentCategory::Malicious);
+        }
+    }
+}

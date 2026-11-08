@@ -679,4 +679,48 @@ mod tests {
     fn empty_api_key_rejected() {
         assert!(LlmClassifier::new(LlmConfig::new("  ")).is_err());
     }
+
+    mod neutralize_props {
+        use super::super::neutralize_tags;
+        use proptest::prelude::*;
+
+        fn fragment() -> impl Strategy<Value = String> {
+            prop::sample::select(vec![
+                "<",
+                "</",
+                "/",
+                "<untrusted_request",
+                "</untrusted_request",
+                "<UNTRUSTED_REQUEST",
+                "</Untrusted_Request>",
+                "untrusted_request",
+                "<untrusted_",
+                "<\u{e9}untrusted_request",
+                " ",
+                "\n",
+            ])
+            .prop_map(String::from)
+        }
+
+        proptest! {
+            #[test]
+            fn neutralized_text_never_contains_wrapper_tag(text in any::<String>()) {
+                let lower = neutralize_tags(&text).to_ascii_lowercase();
+                prop_assert!(!lower.contains("<untrusted_request"));
+                prop_assert!(!lower.contains("</untrusted_request"));
+            }
+
+            #[test]
+            fn neutralized_tag_fragments_never_contain_wrapper_tag(
+                parts in prop::collection::vec(
+                    prop_oneof![fragment(), any::<String>()],
+                    0..24,
+                ),
+            ) {
+                let lower = neutralize_tags(&parts.concat()).to_ascii_lowercase();
+                prop_assert!(!lower.contains("<untrusted_request"));
+                prop_assert!(!lower.contains("</untrusted_request"));
+            }
+        }
+    }
 }

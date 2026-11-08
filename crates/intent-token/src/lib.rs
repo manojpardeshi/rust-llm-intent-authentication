@@ -475,3 +475,83 @@ mod tests {
         assert!(verifier.verify(&unsigned, &req.tool_calls, None).is_err());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    const ISS: &str = "intent-server";
+    const AUD: &str = "tool-gateway";
+
+    fn fixed_issuer() -> JwtIssuer {
+        JwtIssuer::new(IssuerConfig::new(ISS, AUD), &KeyPair::from_seed([7u8; 32])).unwrap()
+    }
+
+    fn fixed_verifier() -> TokenVerifier {
+        TokenVerifier::from_jwks(&fixed_issuer().jwks(), ISS, AUD).unwrap()
+    }
+
+    proptest! {
+        #[test]
+        fn verify_never_panics_or_accepts_arbitrary_strings(token in any::<String>()) {
+            let result = fixed_verifier().verify(&token, &[], None);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn verify_never_accepts_jwt_shaped_strings(
+            token in "[A-Za-z0-9_.-]{0,120}",
+            scope in prop::option::of("[a-z:]{0,12}"),
+        ) {
+            let result = fixed_verifier().verify(&token, &[], scope.as_deref());
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn verify_rejects_tampered_valid_token(pos in any::<usize>(), replacement in 0usize..62) {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            let issuer = fixed_issuer();
+            let verifier = fixed_verifier();
+            let call = ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "/srv/report.txt"}),
+            };
+            let req = IntentRequest {
+                subject: "user-42".into(),
+                session_id: None,
+                messages: vec![],
+                tool_calls: vec![call.clone()],
+                metadata: Default::default(),
+            };
+            let intent = Intent {
+                category: IntentCategory::ReadData,
+                action: "read_file".into(),
+                resource: None,
+                confidence: 0.95,
+                source: intent_core::ClassifierSource::Rules,
+            };
+            let decision = Decision::Allow {
+                scopes: vec!["files:read".into()],
+                ttl: Duration::from_secs(60),
+            };
+            let issued = issuer.issue(&req, &intent, &decision).unwrap();
+            prop_assert!(verifier.verify(&issued.token, &req.tool_calls, Some("files:read")).is_ok());
+
+            // Corrupt one byte of the signed part (header or payload).
+            let signed_len = issued.token.rfind('.').unwrap();
+            let idx = pos % signed_len;
+            let mut bytes = issued.token.clone().into_bytes();
+            let original = bytes[idx];
+            let mut new = ALPHABET[replacement];
+            if new == original {
+                new = ALPHABET[(replacement + 1) % ALPHABET.len()];
+            }
+            bytes[idx] = new;
+            let tampered = String::from_utf8(bytes).unwrap();
+            prop_assert!(verifier.verify(&tampered, &req.tool_calls, Some("files:read")).is_err());
+        }
+    }
+}

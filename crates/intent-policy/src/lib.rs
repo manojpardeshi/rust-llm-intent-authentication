@@ -352,3 +352,116 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    // Not `super::*`: the module's private `fn any()` would shadow proptest's `any`.
+    use super::{Decision, Policy, PolicyEngine};
+    use intent_core::{ClassifierSource, Intent, IntentCategory, IntentRequest};
+    use proptest::prelude::*;
+
+    /// A valid policy with allow rules for several categories.
+    const VALID: &str = r#"
+        [[rule]]
+        category = "ReadData"
+        decision = "allow"
+        scopes = ["files:read"]
+        min_confidence = 0.5
+
+        [[rule]]
+        category = "WriteData"
+        action = "delete_*"
+        decision = "deny"
+
+        [[rule]]
+        category = "WriteData"
+        subjects = ["svc-*"]
+        decision = "allow"
+        scopes = ["files:write"]
+
+        [[rule]]
+        action = "*"
+        decision = "step_up"
+
+        [default]
+        decision = "deny"
+    "#;
+
+    /// Fragments that look like policy TOML, so random docs reach deeper parsing.
+    const FRAGMENTS: &[&str] = &[
+        "[[rule]]\n",
+        "[default]\n",
+        "decision = \"allow\"\n",
+        "decision = \"deny\"\n",
+        "decision = \"step_up\"\n",
+        "category = \"ReadData\"\n",
+        "category = \"Malicious\"\n",
+        "scopes = [\"x\"]\n",
+        "min_confidence = 1.5\n",
+        "min_confidence = 0.5\n",
+        "ttl_secs = 0\n",
+        "subjects = []\n",
+        "subjects = [\"svc-*\"]\n",
+        "action = \"*\"\n",
+        "reason = \"r\"\n",
+        "decison = \"deny\"\n",
+        "junk ===\n",
+        "\"\n",
+        "[\n",
+    ];
+
+    fn category() -> impl Strategy<Value = IntentCategory> {
+        prop::sample::select(vec![
+            IntentCategory::ReadData,
+            IntentCategory::WriteData,
+            IntentCategory::SendMessage,
+            IntentCategory::ExecuteCode,
+            IntentCategory::AdminConfig,
+            IntentCategory::Financial,
+            IntentCategory::Unknown,
+            IntentCategory::Malicious,
+        ])
+    }
+
+    proptest! {
+        #[test]
+        fn parsing_arbitrary_text_never_panics(s in any::<String>()) {
+            let _ = Policy::from_toml_str(&s);
+        }
+
+        #[test]
+        fn parsing_policy_like_text_never_panics(
+            parts in prop::collection::vec(prop::sample::select(FRAGMENTS), 0..16),
+        ) {
+            let _ = Policy::from_toml_str(&parts.concat());
+        }
+
+        #[test]
+        fn valid_policy_never_allows_malicious_or_unknown(
+            cat in category(),
+            action in ".*",
+            subject in ".*",
+            confidence in any::<f32>(),
+        ) {
+            let policy = Policy::from_toml_str(VALID).unwrap();
+            let request = IntentRequest {
+                subject,
+                session_id: None,
+                messages: vec![],
+                tool_calls: vec![],
+                metadata: Default::default(),
+            };
+            let intent = Intent {
+                category: cat,
+                action,
+                resource: None,
+                confidence,
+                source: ClassifierSource::Llm,
+            };
+            let decision = policy.decide(&request, &intent);
+            if matches!(cat, IntentCategory::Malicious | IntentCategory::Unknown) {
+                prop_assert!(!matches!(decision, Decision::Allow { .. }), "got {decision:?}");
+            }
+        }
+    }
+}
