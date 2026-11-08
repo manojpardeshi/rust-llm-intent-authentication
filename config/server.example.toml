@@ -22,3 +22,49 @@ max_body_bytes = 262144
 
 # DANGEROUS: allow starting with no API keys configured. Dev only.
 allow_unauthenticated = false
+
+# --- Hot reload ----------------------------------------------------------
+# Reloaded on SIGHUP (unix) and, when `watch = true`, whenever policy_path or
+# rules_path changes (debounced ~500 ms; parent directories are watched so
+# editor-style replace-on-save works). A reload re-reads the signing key,
+# retired keys, policy and rules and swaps them in atomically. If anything
+# fails to load or validate, the previous configuration keeps serving and an
+# error is logged (metric intent_reloads_total{result="ok"|"error"}).
+# NOT reloadable (restart required): this file itself, bind, issuer, audience,
+# the retired_keys_paths list, API keys, max_body_bytes, rate_limit, llm,
+# threshold, watch.
+watch = false
+
+# --- Key rotation --------------------------------------------------------
+# retired_keys_paths lists public JWKS files ({"keys":[...]}) and/or
+# directories (every *.json inside is read) of rotated-out signing keys. They
+# are verification-only: /v1/verify accepts tokens signed by them and the JWKS
+# endpoint publishes them after the active key. Files holding private key
+# material are rejected, and a retired kid equal to the active kid fails the
+# load. Point it at a directory once, then rotations need only a reload.
+# retired_keys_paths = ["retired"]
+#
+# Rotation procedure (no downtime; old tokens stay valid until you retire them):
+#   1. Move the old key aside and publish its public half:
+#        mv signing.key.json old-2026-11.key.json
+#        intent jwks --key old-2026-11.key.json > retired/old-2026-11.json
+#   2. Generate the new key (keygen refuses to overwrite an existing file):
+#        intent keygen --out signing.key.json
+#   3. Reload:  kill -HUP <intent-server pid>
+#      Check that the "configuration reloaded" audit log line shows the new kid
+#      and that /.well-known/jwks.json lists both keys. A reload that fails
+#      (e.g. missing key file) leaves the old key serving.
+#   4. After the longest token lifetime (max 300 s), delete
+#      retired/old-2026-11.json and reload again; tokens signed by the old key
+#      are then rejected (unknown_key). The server never needs the old private
+#      key, so archive or destroy old-2026-11.key.json as you see fit.
+
+# --- Rate limiting -------------------------------------------------------
+# Optional token bucket for /v1/evaluate and /v1/verify only, applied after
+# authentication (401s never consume a bucket). Keyed by API key when
+# authenticated, otherwise by client IP. Exceeding it returns 429
+# {"error":"rate_limited"} with a Retry-After header. Both values must be > 0.
+# Absent = disabled.
+# [rate_limit]
+# per_second = 20
+# burst = 40

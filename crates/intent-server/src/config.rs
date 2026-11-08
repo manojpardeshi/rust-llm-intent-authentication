@@ -36,6 +36,37 @@ pub struct ServerConfig {
     /// Allow starting without any API key. Dev only.
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    /// Public JWKS files (`{"keys":[...]}`) of rotated-out signing keys. Their
+    /// keys stay valid for `/v1/verify` and are published in the JWKS, but
+    /// are never used for signing. Reloadable.
+    #[serde(default)]
+    pub retired_keys_paths: Vec<PathBuf>,
+    /// Watch `policy_path` and `rules_path` and reload on change.
+    #[serde(default)]
+    pub watch: bool,
+    /// Per-client rate limit for /v1/evaluate and /v1/verify. Absent = off.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+/// Token-bucket rate limit: `burst` requests at once, refilled at
+/// `per_second`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    pub per_second: u32,
+    pub burst: u32,
+}
+
+impl RateLimitConfig {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.per_second == 0 || self.burst == 0 {
+            return Err(Error::Config(
+                "rate_limit.per_second and rate_limit.burst must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_bind() -> SocketAddr {
@@ -56,7 +87,11 @@ fn default_max_body_bytes() -> usize {
 
 impl ServerConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, Error> {
-        toml::from_str(s).map_err(|e| Error::Config(e.to_string()))
+        let config: Self = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
+        if let Some(rl) = &config.rate_limit {
+            rl.validate()?;
+        }
+        Ok(config)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, Error> {
@@ -106,7 +141,7 @@ impl ApiKeys {
     }
 }
 
-fn digest(key: &str) -> [u8; 32] {
+pub(crate) fn digest(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 
@@ -134,6 +169,26 @@ mod tests {
             ServerConfig::from_toml_str("key_path='k'\npolicy_path='p'\nrules_path='r'").unwrap();
         assert_eq!(c.bind.to_string(), "127.0.0.1:8080");
         assert_eq!(c.max_body_bytes, 256 * 1024);
-        assert!(!c.llm && !c.allow_unauthenticated);
+        assert!(!c.llm && !c.allow_unauthenticated && !c.watch);
+        assert!(c.retired_keys_paths.is_empty() && c.rate_limit.is_none());
+    }
+
+    #[test]
+    fn rate_limit_is_validated() {
+        let base = "key_path='k'\npolicy_path='p'\nrules_path='r'\n";
+        let ok =
+            ServerConfig::from_toml_str(&format!("{base}[rate_limit]\nper_second=5\nburst=10"))
+                .unwrap();
+        assert_eq!(ok.rate_limit.unwrap().burst, 10);
+        for bad in [
+            "per_second=0\nburst=1",
+            "per_second=1\nburst=0",
+            "per_second=1",
+        ] {
+            assert!(
+                ServerConfig::from_toml_str(&format!("{base}[rate_limit]\n{bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 }
