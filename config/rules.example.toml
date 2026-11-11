@@ -3,8 +3,8 @@
 # Tool rules are tried in order; the first whose `name` (exact, `prefix*`, or
 # `*`) matches, whose every `args_match` regex matches and none of whose
 # `args_not_match` regexes match wins. If an argument a rule inspects is
-# present but not a string, the call is classified Unknown (no fallthrough).
-# Unmatched tools classify as Unknown with zero confidence, so the LLM
+# present but not a string, the call is classified unknown (no fallthrough).
+# Unmatched tools classify as unknown with zero confidence, so the LLM
 # fallback (or a policy deny) decides.
 
 # Built-in injection signatures (see DEFAULT_INJECTION_PATTERNS) stay on unless disabled.
@@ -17,21 +17,22 @@ pattern = "(?i)\\b(send|post|upload)\\b.{0,40}\\b(password|api[_ -]?key|secret|t
 
 [[tool]]
 name = "read_file"
-category = "ReadData"
+category = "read_data"
 resource_arg = "path"
 
 [[tool]]
 name = "search_*"
-category = "ReadData"
+category = "read_data"
 confidence = 0.9
 
 # SQL: only a positively recognised single SELECT is a read. Everything else
 # (CTEs, multiple statements, comments, SELECT ... INTO, locking reads) is
 # treated as a write, which the example policy sends to step-up. A non-string
-# query is Unknown, which the policy denies. Allow-listing reads is safer than deny-listing writes.
+# query is unknown, which the policy denies. Allow-listing reads is safer
+# than deny-listing writes.
 [[tool]]
 name = "run_sql"
-category = "ReadData"
+category = "read_data"
 action = "sql_read"
 confidence = 0.8
 args_match = { query = "(?is)^\\s*select\\b" }
@@ -40,35 +41,35 @@ args_not_match = { query = "(?is)(;\\s*\\S|--|/\\*|#|\\binto\\b|\\bfor\\s+(updat
 
 [[tool]]
 name = "run_sql"
-category = "WriteData"
+category = "write_data"
 action = "sql_write"
 
 # --- Writes ----------------------------------------------------------------
 
 [[tool]]
 name = "write_file"
-category = "WriteData"
+category = "write_data"
 resource_arg = "path"
 
 [[tool]]
 name = "delete_*"
-category = "WriteData"
+category = "write_data"
 
 # --- Side effects ----------------------------------------------------------
 
 [[tool]]
 name = "send_email"
-category = "SendMessage"
+category = "send_message"
 resource_arg = "to"
 
 [[tool]]
 name = "run_shell"
-category = "ExecuteCode"
+category = "execute_code"
 
 [[tool]]
 name = "transfer_funds"
-category = "Financial"
+category = "financial"
 
 [[tool]]
 name = "update_iam_*"
-category = "AdminConfig"
+category = "admin_config"

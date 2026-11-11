@@ -33,7 +33,7 @@ List targets with `cargo fuzz list`. Crashing inputs are written to
 |------------------|--------------------------------|----------------------------------------------------------------------------|
 | `digest`         | bytes as JSON `Vec<ToolCall>`  | no panic; digest is unchanged by a serialize/parse round trip              |
 | `request_json`   | bytes as JSON `IntentRequest`  | no panic in `request_digest`                                               |
-| `policy_toml`    | UTF-8 as policy TOML           | no panic in `decide` on a fixed intent set; `Malicious` is never allowed   |
+| `policy_toml`    | UTF-8 as policy TOML           | no panic in `decide` on a fixed intent set; `malicious` is never allowed   |
 | `rules_classify` | structured (`arbitrary`)       | no panic; confidence in `[0, 1]`, using `config/rules.example.toml`        |
 | `token_verify`   | UTF-8 as a bearer token        | no panic; a token without the signing key is never accepted                |
 

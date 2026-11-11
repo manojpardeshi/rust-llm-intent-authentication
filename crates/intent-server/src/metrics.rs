@@ -36,7 +36,12 @@ impl Metrics {
         }
     }
 
-    pub fn record_evaluation(&self, decision: &'static str, category: String, took: Duration) {
+    pub fn record_evaluation(
+        &self,
+        decision: &'static str,
+        category: &'static str,
+        took: Duration,
+    ) {
         metrics::with_local_recorder(&*self.recorder, || {
             counter!("intent_evaluations_total", "decision" => decision, "category" => category)
                 .increment(1);

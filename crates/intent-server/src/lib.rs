@@ -552,7 +552,7 @@ async fn evaluate(
         target: "intent::audit",
         subject = %req.subject,
         session_id = req.session_id.as_deref(),
-        category = ?intent.category,
+        category = intent.category.as_str(),
         action = %intent.action,
         resource = intent.resource.as_deref(),
         confidence = intent.confidence,
@@ -564,7 +564,7 @@ async fn evaluate(
         "evaluate"
     );
     if let Some(m) = &state.metrics {
-        m.record_evaluation(name, format!("{:?}", intent.category), started.elapsed());
+        m.record_evaluation(name, intent.category.as_str(), started.elapsed());
     }
 
     let mut body = serde_json::to_value(&evaluation).map_err(|_| ApiError::Internal)?;

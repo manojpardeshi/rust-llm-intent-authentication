@@ -1,32 +1,32 @@
 # Policy: first matching rule wins; anything unmatched hits [default].
 #
 # Always enforced regardless of this file:
-#   - Malicious intents are denied.
+#   - malicious intents are denied.
 #   - [default] may not be "allow".
 #   - "allow" rules must name a concrete category and grant at least one scope.
 #   - Token lifetime is capped at 300s by the issuer.
 
 [[rule]]
-category = "ReadData"
+category = "read_data"
 decision = "allow"
 scopes = ["data:read"]
 ttl_secs = 120
 min_confidence = 0.7
 
 [[rule]]
-category = "WriteData"
+category = "write_data"
 action = "delete_*"
 decision = "deny"
 reason = "deletes are never automated"
 
 [[rule]]
-category = "WriteData"
+category = "write_data"
 action = "sql_write"
 decision = "step_up"
 reason = "schema/data changes need approval"
 
 [[rule]]
-category = "WriteData"
+category = "write_data"
 decision = "allow"
 scopes = ["data:write"]
 # Only rule-derived intents (optionally LLM-confirmed) may earn write tokens.
@@ -35,7 +35,7 @@ ttl_secs = 60
 min_confidence = 0.9
 
 [[rule]]
-category = "SendMessage"
+category = "send_message"
 decision = "allow"
 scopes = ["messages:send"]
 sources = ["rules", "hybrid"]
@@ -43,12 +43,12 @@ ttl_secs = 60
 min_confidence = 0.85
 
 [[rule]]
-category = "Financial"
+category = "financial"
 decision = "step_up"
 reason = "financial actions require human approval"
 
 [[rule]]
-category = "AdminConfig"
+category = "admin_config"
 decision = "step_up"
 
 [default]

@@ -245,7 +245,7 @@ async fn bad_retired_keys_fail_reload_and_keep_serving() {
 
 fn deny_reads_policy() -> String {
     format!(
-        "[[rule]]\ncategory = \"ReadData\"\ndecision = \"deny\"\nreason = \"reads frozen\"\n\n{}",
+        "[[rule]]\ncategory = \"read_data\"\ndecision = \"deny\"\nreason = \"reads frozen\"\n\n{}",
         read("config/policy.example.toml")
     )
 }

@@ -111,11 +111,11 @@ mod tests {
     const RULES: &str = r#"
         [[tool]]
         name = "read_file"
-        category = "ReadData"
+        category = "read_data"
 
         [[tool]]
         name = "http_get"
-        category = "ReadData"
+        category = "read_data"
         confidence = 0.6
     "#;
 
@@ -254,7 +254,7 @@ mod tests {
     async fn llm_cannot_downgrade_rule_category() {
         // A low-confidence Financial rule result must not be relaxed to ReadData.
         let rules = RuleClassifier::from_toml_str(
-            "[[tool]]\nname = \"pay\"\ncategory = \"Financial\"\nconfidence = 0.5",
+            "[[tool]]\nname = \"pay\"\ncategory = \"financial\"\nconfidence = 0.5",
         )
         .unwrap();
         let llm = MockLlm::returning(IntentCategory::ReadData, 0.99);

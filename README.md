@@ -30,7 +30,7 @@ Tool gateway ──► intent-verifier (JWKS) ──► signature, scope, req_ha
    (fail closed).
 2. **Decide.** A TOML policy maps the intent to `allow` (with scopes and a TTL),
    `deny`, or `step_up` (needs a human). The first matching rule wins, the
-   default is deny, and `Malicious` intents are always denied. A request with
+   default is deny, and `malicious` intents are always denied. A request with
    several tool calls is classified and decided **per call**: any deny wins,
    then any step-up, otherwise the token gets the union of scopes and the
    shortest TTL.
@@ -43,8 +43,11 @@ Tool gateway ──► intent-verifier (JWKS) ──► signature, scope, req_ha
    expiry, the required scope, and recomputes `req_hash` from the call it is
    about to run. Tokens can optionally be single-use (`jti` replay store).
 
-Intent categories: `ReadData`, `WriteData`, `ExecuteCode`, `SendMessage`,
-`Financial`, `AdminConfig`, `Unknown`, `Malicious`.
+Intent categories, least to most restrictive: `read_data`, `write_data`,
+`send_message`, `execute_code`, `admin_config`, `financial`, `unknown`,
+`malicious`. This is how they appear in policy and rules files, API
+responses and tokens. The older PascalCase spellings (`ReadData`) are still
+accepted in policy and rules files.
 
 ## What a token does and does not guarantee
 

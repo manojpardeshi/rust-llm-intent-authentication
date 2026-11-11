@@ -60,19 +60,70 @@ pub struct IntentRequest {
 }
 
 /// Coarse intent categories, ordered from least to most restrictive.
+///
+/// Serialised in `snake_case` (`read_data`, `send_message`, ...), like every
+/// other enum on the wire. The older PascalCase spellings (`ReadData`) are
+/// still accepted on input as aliases, so existing policy and rules files
+/// keep working; output always uses `snake_case`.
+///
+/// Non-exhaustive so categories can be added without a breaking change;
+/// code outside this crate must handle unknown variants (treat them as
+/// at least as restrictive as `Unknown`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IntentCategory {
+    #[serde(alias = "ReadData")]
     ReadData,
+    #[serde(alias = "WriteData")]
     WriteData,
+    #[serde(alias = "SendMessage")]
     SendMessage,
+    #[serde(alias = "ExecuteCode")]
     ExecuteCode,
+    #[serde(alias = "AdminConfig")]
     AdminConfig,
+    #[serde(alias = "Financial")]
     Financial,
+    #[serde(alias = "Unknown")]
     Unknown,
+    #[serde(alias = "Malicious")]
     Malicious,
 }
 
+impl std::fmt::Display for IntentCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl IntentCategory {
+    /// Every category, least to most restrictive.
+    pub const ALL: [Self; 8] = [
+        Self::ReadData,
+        Self::WriteData,
+        Self::SendMessage,
+        Self::ExecuteCode,
+        Self::AdminConfig,
+        Self::Financial,
+        Self::Unknown,
+        Self::Malicious,
+    ];
+
+    /// The wire name, e.g. `"read_data"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadData => "read_data",
+            Self::WriteData => "write_data",
+            Self::SendMessage => "send_message",
+            Self::ExecuteCode => "execute_code",
+            Self::AdminConfig => "admin_config",
+            Self::Financial => "financial",
+            Self::Unknown => "unknown",
+            Self::Malicious => "malicious",
+        }
+    }
+
     /// Higher means more sensitive. Used to resolve disagreements between
     /// classifiers by picking the stricter result.
     pub fn restrictiveness(self) -> u8 {
@@ -518,6 +569,25 @@ mod tests {
         assert!(tool_calls_digest(&[call(json!({"id": -(MAX_SAFE_INTEGER as i64)}))]).is_ok());
         assert!(tool_calls_digest(&[call(json!({"id": "9007199254740993"}))]).is_ok());
         assert!(tool_calls_digest(&[call(json!({"x": 1.5e300}))]).is_ok());
+    }
+
+    #[test]
+    fn category_wire_format_is_snake_case_with_legacy_aliases() {
+        for c in IntentCategory::ALL {
+            let json = serde_json::to_value(c).unwrap();
+            assert_eq!(json, json!(c.as_str()));
+            assert_eq!(c.to_string(), c.as_str());
+            let back: IntentCategory = serde_json::from_value(json).unwrap();
+            assert_eq!(back, c);
+            // The old PascalCase spelling (the Debug name) still parses.
+            let legacy: IntentCategory = serde_json::from_value(json!(format!("{c:?}"))).unwrap();
+            assert_eq!(legacy, c);
+        }
+        assert!(serde_json::from_value::<IntentCategory>(json!("readdata")).is_err());
+        assert_eq!(
+            IntentCategory::ALL.map(|c| c.restrictiveness()),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
     }
 
     #[test]

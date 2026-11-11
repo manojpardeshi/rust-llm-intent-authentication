@@ -211,26 +211,26 @@ mod tests {
 
     const POLICY: &str = r#"
         [[rule]]
-        category = "ReadData"
+        category = "read_data"
         decision = "allow"
         scopes = ["files:read"]
         ttl_secs = 60
         min_confidence = 0.7
 
         [[rule]]
-        category = "WriteData"
+        category = "write_data"
         action = "delete_*"
         decision = "deny"
         reason = "deletes are never automated"
 
         [[rule]]
-        category = "WriteData"
+        category = "write_data"
         subjects = ["svc-*"]
         decision = "allow"
         scopes = ["files:write"]
 
         [[rule]]
-        category = "Financial"
+        category = "financial"
         decision = "step_up"
 
         [default]
@@ -286,11 +286,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pascal_case_categories_still_load() {
+        let p = Policy::from_toml_str(
+            "[[rule]]\ncategory = \"ReadData\"\ndecision = \"allow\"\nscopes = [\"r\"]\n[default]\ndecision = \"deny\"",
+        )
+        .unwrap();
+        assert!(matches!(
+            p.decide(
+                &req("a"),
+                &intent(IntentCategory::ReadData, "read_file", 1.0)
+            ),
+            Decision::Allow { .. }
+        ));
+    }
+
+    #[test]
     fn sources_restrict_which_classifier_may_earn_an_allow() {
         let p = Policy::from_toml_str(
             r#"
             [[rule]]
-            category = "WriteData"
+            category = "write_data"
             decision = "allow"
             scopes = ["w"]
             sources = ["rules", "hybrid"]
@@ -405,11 +420,11 @@ mod tests {
             // default allow
             "[default]\ndecision = \"allow\"",
             // allow without scopes
-            "[[rule]]\ncategory = \"ReadData\"\ndecision = \"allow\"\n[default]\ndecision = \"deny\"",
+            "[[rule]]\ncategory = \"read_data\"\ndecision = \"allow\"\n[default]\ndecision = \"deny\"",
             // allow for any category
             "[[rule]]\ndecision = \"allow\"\nscopes = [\"x\"]\n[default]\ndecision = \"deny\"",
             // allow Unknown
-            "[[rule]]\ncategory = \"Unknown\"\ndecision = \"allow\"\nscopes = [\"x\"]\n[default]\ndecision = \"deny\"",
+            "[[rule]]\ncategory = \"unknown\"\ndecision = \"allow\"\nscopes = [\"x\"]\n[default]\ndecision = \"deny\"",
             // bad confidence
             "[[rule]]\ndecision = \"deny\"\nmin_confidence = 1.5\n[default]\ndecision = \"deny\"",
             // typo'd field
@@ -431,18 +446,18 @@ mod proptests {
     /// A valid policy with allow rules for several categories.
     const VALID: &str = r#"
         [[rule]]
-        category = "ReadData"
+        category = "read_data"
         decision = "allow"
         scopes = ["files:read"]
         min_confidence = 0.5
 
         [[rule]]
-        category = "WriteData"
+        category = "write_data"
         action = "delete_*"
         decision = "deny"
 
         [[rule]]
-        category = "WriteData"
+        category = "write_data"
         subjects = ["svc-*"]
         decision = "allow"
         scopes = ["files:write"]
@@ -462,8 +477,8 @@ mod proptests {
         "decision = \"allow\"\n",
         "decision = \"deny\"\n",
         "decision = \"step_up\"\n",
-        "category = \"ReadData\"\n",
-        "category = \"Malicious\"\n",
+        "category = \"read_data\"\n",
+        "category = \"malicious\"\n",
         "scopes = [\"x\"]\n",
         "min_confidence = 1.5\n",
         "min_confidence = 0.5\n",

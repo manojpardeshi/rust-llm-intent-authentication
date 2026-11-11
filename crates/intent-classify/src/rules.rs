@@ -286,24 +286,24 @@ mod tests {
 
         [[tool]]
         name = "read_file"
-        category = "ReadData"
+        category = "read_data"
         resource_arg = "path"
 
         [[tool]]
         name = "run_sql"
-        category = "WriteData"
+        category = "write_data"
         action = "sql_write"
         args_match = { query = "(?i)^\\s*(insert|update|delete|drop)\\b" }
 
         [[tool]]
         name = "run_sql"
-        category = "ReadData"
+        category = "read_data"
         action = "sql_read"
         confidence = 0.8
 
         [[tool]]
         name = "transfer_*"
-        category = "Financial"
+        category = "financial"
     "#;
 
     fn classifier() -> RuleClassifier {
@@ -436,7 +436,7 @@ mod tests {
         assert!(RuleClassifier::from_toml_str("[[injection]]\npattern = \"(\"").is_err());
         assert!(
             RuleClassifier::from_toml_str(
-                "[[tool]]\nname = \"x\"\ncategory = \"ReadData\"\nconfidence = 2.0"
+                "[[tool]]\nname = \"x\"\ncategory = \"read_data\"\nconfidence = 2.0"
             )
             .is_err()
         );
@@ -512,11 +512,11 @@ mod tests {
             r#"
             [[tool]]
             name = "fetch"
-            category = "ReadData"
+            category = "read_data"
             args_not_match = { url = "^http:" }
             [[tool]]
             name = "fetch"
-            category = "SendMessage"
+            category = "send_message"
             "#,
         )
         .unwrap();
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(get("http://a"), IntentCategory::SendMessage);
         assert!(
             RuleClassifier::from_toml_str(
-                "[[tool]]\nname = \"x\"\ncategory = \"ReadData\"\nargs_not_match = { a = \"(\" }"
+                "[[tool]]\nname = \"x\"\ncategory = \"read_data\"\nargs_not_match = { a = \"(\" }"
             )
             .is_err()
         );

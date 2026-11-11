@@ -6,7 +6,7 @@ State at review time: `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all -- --check` and all 148 tests pass. `cargo audit` was not run
 (not installed), so dependencies are unchecked for advisories.
 
-Status (2026-11-10): everything is fixed except the enum casing decision.
+Status (2026-11-11): everything is fixed.
 Each item notes what changed. After the fixes: fmt and clippy (all features
 and no default features) clean, 164 tests pass, every fuzz target ran 20 s
 with no crashes.
@@ -145,7 +145,7 @@ endpoint is stateless.
   `intent-token` (`validation.leeway`) and
   `crates/intent-verifier/src/replay.rs` (`LEEWAY`). Export one constant
   from `intent-token`.
-- [ ] **Enum casing:** not changed; needs a decision (breaking wire-format change). `IntentCategory` serialises as PascalCase while every
+- [x] **Enum casing:** fixed. `IntentCategory` now serialises as `snake_case` (`read_data`), with the old PascalCase names accepted as input aliases, and is `#[non_exhaustive]`. Metrics labels and audit logs use the same names. `IntentCategory` serialises as PascalCase while every
   other enum is snake_case. Settle the wire format (and consider
   `#[non_exhaustive]`) before 1.0.
 - [x] **`/metrics` is unauthenticated:** documented, plus optional `metrics_require_auth`. acceptable behind a private

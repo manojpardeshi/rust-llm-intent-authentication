@@ -140,7 +140,7 @@ async fn scenario_decisions() {
 
     let (s, b) = evaluate(&app, "injection").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    assert_eq!(b["intent"]["category"], "Malicious");
+    assert_eq!(b["intent"]["category"], "malicious");
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn batching_cannot_bypass_per_call_policy() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["scopes"], json!(["data:read", "messages:send"]));
     assert_eq!(body["ttl"], json!(60));
-    assert_eq!(body["intent"]["category"], json!("SendMessage"));
+    assert_eq!(body["intent"]["category"], json!("send_message"));
 }
 
 /// IMPROVEMENTS 1.3: integers beyond double precision cannot be bound to a
