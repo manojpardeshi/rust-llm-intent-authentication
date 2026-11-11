@@ -1,0 +1,19 @@
+# cargo-audit configuration (read by `cargo audit` in CI).
+#
+# Each ignore needs a reason and should be revisited whenever jsonwebtoken
+# is upgraded. Run `cargo tree -i <crate>` to confirm the dependency path.
+
+[advisories]
+ignore = [
+  # rsa 0.9 "Marvin" timing side channel (RSA decryption/signing).
+  # Pulled in only because jsonwebtoken's `rust_crypto` feature bundles
+  # every algorithm. This project never creates or accepts RSA keys: the
+  # issuer signs with Ed25519 only and every verifier pins
+  # `Validation::new(Algorithm::EdDSA)` with Ed25519 decoding keys, so no
+  # RSA code runs. No fixed rsa release is usable via jsonwebtoken 11.1.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5 timing variability, reached via p256/p384 (ECDSA),
+  # likewise bundled by jsonwebtoken's `rust_crypto`. No ECDSA keys are
+  # ever created or accepted here (see above).
+  "RUSTSEC-2026-0387",
+]
