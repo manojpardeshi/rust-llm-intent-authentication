@@ -6,6 +6,7 @@
 //! replayed for a different action.
 
 mod keys;
+mod replay;
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +19,11 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 pub use keys::{Jwk, Jwks, KeyPair};
+pub use replay::{InMemoryReplayStore, ReplayError, ReplayStore};
+
+/// Seconds of clock skew tolerated on `exp`/`nbf`. Replay stores must keep a
+/// `jti` at least this long past `exp`, or an expiring token could be reused.
+pub const LEEWAY_SECS: u64 = 5;
 
 /// Hard upper bound on token lifetime, regardless of policy.
 pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(300);
@@ -256,7 +262,7 @@ impl TokenVerifier {
         validation.set_audience(&[audience]);
         validation.set_required_spec_claims(&["exp", "nbf", "iat", "iss", "aud", "sub"]);
         validation.validate_nbf = true;
-        validation.leeway = 5;
+        validation.leeway = LEEWAY_SECS;
         Ok(Self { keys, validation })
     }
 

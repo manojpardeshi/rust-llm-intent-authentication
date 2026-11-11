@@ -20,19 +20,23 @@ fn read(rel: &str) -> String {
 }
 
 fn app(max_body: usize) -> Router {
+    app_with(&format!("max_body_bytes = {max_body}"), KEY)
+}
+
+fn app_with(extra: &str, keys: &str) -> Router {
     let dir = std::env::temp_dir().join(format!("intent-server-test-{}", uuid_like()));
     std::fs::create_dir_all(&dir).unwrap();
     let key_path = dir.join("signing.key.json");
     KeyPair::generate().unwrap().save(&key_path).unwrap();
     let config = ServerConfig::from_toml_str(&format!(
-        "key_path = {:?}\npolicy_path = {:?}\nrules_path = {:?}\nmax_body_bytes = {max_body}",
+        "key_path = {:?}\npolicy_path = {:?}\nrules_path = {:?}\n{extra}",
         key_path,
         root().join("config/policy.example.toml"),
         root().join("config/rules.example.toml"),
     ))
     .unwrap();
     let state =
-        AppState::from_config(&config, ApiKeys::from_csv(KEY), Some(Metrics::new())).unwrap();
+        AppState::from_config(&config, ApiKeys::from_csv(keys), Some(Metrics::new())).unwrap();
     std::fs::remove_dir_all(&dir).ok();
     router(state)
 }
@@ -230,4 +234,157 @@ fn refuses_to_start_without_keys() {
         AppState::from_config(&config, ApiKeys::default(), None),
         Err(intent_server::Error::NoApiKeys)
     ));
+}
+
+fn request_with(calls: Value) -> String {
+    json!({"subject": "user-42", "messages": [], "tool_calls": calls}).to_string()
+}
+
+/// IMPROVEMENTS 1.1: batching a forbidden call with an allowed one must not
+/// launder it. Each call is decided on its own and the strictest wins.
+#[tokio::test]
+async fn batching_cannot_bypass_per_call_policy() {
+    let app = app(256 * 1024);
+    let email = json!({"name": "send_email", "arguments": {"to": "a@b.c", "body": "hi"}});
+    let delete = json!({"name": "delete_records", "arguments": {"table": "users"}});
+    let drop = json!({"name": "run_sql", "arguments": {"query": "drop table users"}});
+    let read = json!({"name": "read_file", "arguments": {"path": "/srv/a"}});
+
+    let cases = [
+        (json!([delete.clone()]), StatusCode::FORBIDDEN, "deny"),
+        (
+            json!([delete, email.clone()]),
+            StatusCode::FORBIDDEN,
+            "deny",
+        ),
+        (json!([drop.clone()]), StatusCode::ACCEPTED, "step_up"),
+        (
+            json!([drop, email.clone()]),
+            StatusCode::ACCEPTED,
+            "step_up",
+        ),
+    ];
+    for (calls, status, decision) in cases {
+        let (s, body) = call(
+            &app,
+            post("/v1/evaluate", Some(KEY), request_with(calls.clone())),
+        )
+        .await;
+        assert_eq!(
+            (s, body["decision"].as_str()),
+            (status, Some(decision)),
+            "{calls} -> {body}"
+        );
+        assert!(body.get("token").is_none(), "{calls}");
+    }
+
+    // Two allowed calls: union of scopes, shortest TTL.
+    let (s, body) = call(
+        &app,
+        post(
+            "/v1/evaluate",
+            Some(KEY),
+            request_with(json!([read, email])),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["scopes"], json!(["data:read", "messages:send"]));
+    assert_eq!(body["ttl"], json!(60));
+    assert_eq!(body["intent"]["category"], json!("SendMessage"));
+}
+
+/// IMPROVEMENTS 1.3: integers beyond double precision cannot be bound to a
+/// token without collisions, so the request is rejected up front.
+#[tokio::test]
+async fn unsafe_integer_arguments_are_rejected() {
+    let app = app(256 * 1024);
+    let body = r#"{"subject":"u","tool_calls":[{"name":"read_file","arguments":{"path":"/a","id":9007199254740993}}]}"#;
+    let (s, b) = call(&app, post("/v1/evaluate", Some(KEY), body.into())).await;
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_request")),
+        "{b}"
+    );
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// IMPROVEMENTS 2.1: a key bound to subject patterns cannot ask for others.
+#[tokio::test]
+async fn subject_bindings_limit_which_subjects_a_key_may_request() {
+    let extra = format!("[subject_bindings]\n{:?} = [\"user-*\"]", sha256_hex(KEY));
+    let app = app_with(&extra, &format!("{KEY},unbound-key"));
+    let body = |subject: &str| {
+        json!({"subject": subject, "tool_calls": [{"name": "read_file", "arguments": {"path": "/a"}}]})
+            .to_string()
+    };
+    let (s, _) = call(&app, post("/v1/evaluate", Some(KEY), body("user-42"))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, b) = call(&app, post("/v1/evaluate", Some(KEY), body("svc-admin"))).await;
+    assert_eq!(
+        (s, b["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("subject_not_allowed"))
+    );
+    // Keys without a binding are unrestricted unless require_subject_binding.
+    let (s, _) = call(
+        &app,
+        post("/v1/evaluate", Some("unbound-key"), body("svc-admin")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let strict = app_with(
+        &format!("require_subject_binding = true\n{extra}"),
+        &format!("{KEY},unbound-key"),
+    );
+    let (s, _) = call(
+        &strict,
+        post("/v1/evaluate", Some("unbound-key"), body("user-1")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+/// IMPROVEMENTS 2.3: /v1/verify can be made single-use.
+#[tokio::test]
+async fn verify_single_use_consumes_jti() {
+    for (single_use, second) in [(false, StatusCode::OK), (true, StatusCode::UNAUTHORIZED)] {
+        let app = app_with(&format!("verify_single_use = {single_use}"), KEY);
+        let (_, ev) = evaluate(&app, "allow_read").await;
+        let verify = json!({
+            "token": ev["token"]["token"],
+            "tool_calls": tool_calls_of("allow_read"),
+        })
+        .to_string();
+        let (s1, _) = call(&app, post("/v1/verify", Some(KEY), verify.clone())).await;
+        assert_eq!(s1, StatusCode::OK);
+        let (s2, b2) = call(&app, post("/v1/verify", Some(KEY), verify)).await;
+        assert_eq!(s2, second, "single_use={single_use} {b2}");
+        if single_use {
+            assert_eq!(b2["error"], "replayed");
+        }
+    }
+}
+
+#[tokio::test]
+async fn metrics_can_require_auth() {
+    let open = app(256 * 1024);
+    assert_eq!(call(&open, get("/metrics")).await.0, StatusCode::OK);
+    let locked = app_with("metrics_require_auth = true", KEY);
+    assert_eq!(
+        call(&locked, get("/metrics")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let req = Request::get("/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {KEY}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(call(&locked, req).await.0, StatusCode::OK);
 }

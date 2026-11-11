@@ -14,7 +14,10 @@ pub const DEFAULT_THRESHOLD: f32 = 0.85;
 ///
 /// - `Malicious` rule results, or ones at/above `threshold`, are returned as is.
 /// - Otherwise the fallback is consulted. If rules had an opinion (anything
-///   but `Unknown`), the stricter of the two categories wins.
+///   but `Unknown`), the stricter of the two categories wins, and on
+///   agreement the rule's confidence is kept (the LLM never raises trust).
+/// - If rules said `Unknown`, the LLM's answer is returned with source `Llm`;
+///   policy can refuse such intents with `sources = ["rules", "hybrid"]`.
 /// - A fallback error yields `Unknown` with zero confidence (fail closed).
 /// - Without a fallback, the rule result is returned unchanged and policy
 ///   `min_confidence` decides.
@@ -69,12 +72,18 @@ impl IntentClassifier for HybridClassifier {
         };
         llm.confidence = llm.confidence.clamp(0.0, 1.0);
 
+        // The LLM reads attacker-influenced text, so it may only make a
+        // result stricter, never more trusted.
         if ruled.category == IntentCategory::Unknown {
+            // Rules had no opinion. Return the LLM's answer labelled `Llm`,
+            // so policy rules with `sources = ["rules"]` will not accept it.
+            llm.source = ClassifierSource::Llm;
             return Ok(llm);
         }
         if ruled.category == llm.category {
+            // Agreement keeps the rule's confidence: the LLM cannot lift a
+            // low-confidence rule match over a policy `min_confidence` bar.
             return Ok(Intent {
-                confidence: ruled.confidence.max(llm.confidence),
                 source: ClassifierSource::Hybrid,
                 ..ruled
             });
@@ -216,14 +225,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agreement_boosts_confidence() {
+    async fn agreement_keeps_rule_confidence() {
+        // IMPROVEMENTS 2.2: the LLM confirming a low-confidence rule match
+        // must not lift it over a policy min_confidence bar.
         let llm = MockLlm::returning(IntentCategory::ReadData, 0.92);
         let i = hybrid(Some(llm))
             .classify(&req("http_get", "hi"))
             .await
             .unwrap();
         assert_eq!(i.category, IntentCategory::ReadData);
-        assert_eq!(i.confidence, 0.92);
+        assert_eq!(i.confidence, 0.6);
         assert_eq!(i.source, ClassifierSource::Hybrid);
     }
 

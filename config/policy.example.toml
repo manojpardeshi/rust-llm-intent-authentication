@@ -29,6 +29,8 @@ reason = "schema/data changes need approval"
 category = "WriteData"
 decision = "allow"
 scopes = ["data:write"]
+# Only rule-derived intents (optionally LLM-confirmed) may earn write tokens.
+sources = ["rules", "hybrid"]
 ttl_secs = 60
 min_confidence = 0.9
 
@@ -36,6 +38,7 @@ min_confidence = 0.9
 category = "SendMessage"
 decision = "allow"
 scopes = ["messages:send"]
+sources = ["rules", "hybrid"]
 ttl_secs = 60
 min_confidence = 0.85
 

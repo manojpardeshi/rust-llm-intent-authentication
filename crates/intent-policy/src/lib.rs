@@ -8,7 +8,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use intent_core::{Decision, Intent, IntentCategory, IntentRequest, PolicyEngine, glob_match};
+use intent_core::{
+    ClassifierSource, Decision, Intent, IntentCategory, IntentRequest, PolicyEngine, glob_match,
+};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +43,12 @@ pub struct Rule {
     /// Subject patterns; `["*"]` when omitted.
     #[serde(default = "any")]
     pub subjects: Vec<String>,
+    /// Classifier sources this rule accepts (`rules`, `llm`, `hybrid`). Any
+    /// source when omitted. Use `["rules"]` on sensitive allows so that only a
+    /// rule-derived intent, never one taken from the LLM's reading of
+    /// attacker-influenced text, can earn the token.
+    #[serde(default)]
+    pub sources: Option<Vec<ClassifierSource>>,
     pub decision: DecisionKind,
     #[serde(default)]
     pub scopes: Vec<String>,
@@ -120,6 +128,11 @@ impl Policy {
                     )));
                 }
             }
+            if rule.sources.as_ref().is_some_and(Vec::is_empty) {
+                return Err(PolicyError::Invalid(format!(
+                    "rule {n}: sources must not be empty when present"
+                )));
+            }
             if rule.subjects.is_empty() {
                 return Err(PolicyError::Invalid(format!(
                     "rule {n}: subjects must not be empty"
@@ -139,6 +152,10 @@ impl Policy {
                 .subjects
                 .iter()
                 .any(|p| glob_match(p, &request.subject))
+            && rule
+                .sources
+                .as_ref()
+                .is_none_or(|s| s.contains(&intent.source))
     }
 
     fn to_decision(kind: DecisionKind, rule: Option<&Rule>, reason: Option<&str>) -> Decision {
@@ -266,6 +283,45 @@ mod tests {
             &intent(IntentCategory::ReadData, "read_file", 0.5),
         );
         assert!(matches!(d, Decision::Deny { reason } if reason.contains("confidence")));
+    }
+
+    #[test]
+    fn sources_restrict_which_classifier_may_earn_an_allow() {
+        let p = Policy::from_toml_str(
+            r#"
+            [[rule]]
+            category = "WriteData"
+            decision = "allow"
+            scopes = ["w"]
+            sources = ["rules", "hybrid"]
+
+            [default]
+            decision = "deny"
+            "#,
+        )
+        .unwrap();
+        let with = |source| Intent {
+            source,
+            ..intent(IntentCategory::WriteData, "write_file", 1.0)
+        };
+        assert!(matches!(
+            p.decide(&req("a"), &with(ClassifierSource::Rules)),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            p.decide(&req("a"), &with(ClassifierSource::Hybrid)),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            p.decide(&req("a"), &with(ClassifierSource::Llm)),
+            Decision::Deny { .. }
+        ));
+        assert!(
+            Policy::from_toml_str(
+                "[[rule]]\ndecision = \"deny\"\nsources = []\n[default]\ndecision = \"deny\""
+            )
+            .is_err()
+        );
     }
 
     #[test]

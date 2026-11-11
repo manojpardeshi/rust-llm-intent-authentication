@@ -197,9 +197,30 @@ impl Evaluator {
         }
     }
 
+    /// Runs the pipeline. A request with several tool calls is classified and
+    /// decided once per call (each call's sub-request keeps the full message
+    /// history, so injection checks still see everything), and the results
+    /// are combined by [`combine_decisions`]. Policy therefore sees every
+    /// call's action, and a batch can never be less restricted than its
+    /// strictest call.
     pub async fn evaluate(&self, request: &IntentRequest) -> Result<Evaluation> {
-        let intent = self.classifier.classify(request).await?;
-        let decision = self.policy.decide(request, &intent);
+        let (intent, decision) = if request.tool_calls.len() <= 1 {
+            let intent = self.classifier.classify(request).await?;
+            let decision = self.policy.decide(request, &intent);
+            (intent, decision)
+        } else {
+            let mut results = Vec::with_capacity(request.tool_calls.len());
+            for call in &request.tool_calls {
+                let sub = IntentRequest {
+                    tool_calls: vec![call.clone()],
+                    ..request.clone()
+                };
+                let intent = self.classifier.classify(&sub).await?;
+                let decision = self.policy.decide(&sub, &intent);
+                results.push((call.name.as_str(), intent, decision));
+            }
+            combine_per_call(results)
+        };
         let token = match decision {
             Decision::Allow { .. } => Some(self.issuer.issue(request, &intent, &decision)?),
             _ => None,
@@ -212,14 +233,116 @@ impl Evaluator {
     }
 }
 
+/// Combines per-call decisions: any deny wins, else any step-up, else allow
+/// with the sorted union of scopes and the shortest TTL. Deny and step-up
+/// reasons from several calls are joined, each prefixed with its tool name.
+pub fn combine_decisions<'a>(
+    decisions: impl IntoIterator<Item = (&'a str, &'a Decision)>,
+) -> Decision {
+    let mut denies = Vec::new();
+    let mut step_ups = Vec::new();
+    let mut scopes = std::collections::BTreeSet::new();
+    let mut ttl: Option<Duration> = None;
+    let mut any = false;
+    for (name, decision) in decisions {
+        any = true;
+        match decision {
+            Decision::Deny { reason } => denies.push(format!("{name}: {reason}")),
+            Decision::StepUp { reason } => step_ups.push(format!("{name}: {reason}")),
+            Decision::Allow { scopes: s, ttl: t } => {
+                scopes.extend(s.iter().cloned());
+                ttl = Some(ttl.map_or(*t, |cur| cur.min(*t)));
+            }
+        }
+    }
+    if !any {
+        return Decision::Deny {
+            reason: "no decisions to combine".into(),
+        };
+    }
+    if !denies.is_empty() {
+        Decision::Deny {
+            reason: denies.join("; "),
+        }
+    } else if !step_ups.is_empty() {
+        Decision::StepUp {
+            reason: step_ups.join("; "),
+        }
+    } else {
+        Decision::Allow {
+            scopes: scopes.into_iter().collect(),
+            ttl: ttl.unwrap_or_default(),
+        }
+    }
+}
+
+/// Picks the reported intent for a batch (strictest category, first such
+/// call, lowest confidence across calls) and combines the decisions.
+fn combine_per_call(results: Vec<(&str, Intent, Decision)>) -> (Intent, Decision) {
+    let decision = combine_decisions(results.iter().map(|(n, _, d)| (*n, d)));
+    let min_confidence =
+        results
+            .iter()
+            .map(|(_, i, _)| i.confidence)
+            .fold(
+                f32::INFINITY,
+                |a, b| if b.is_nan() || b < a { b } else { a },
+            );
+    let mut intent = results
+        .iter()
+        .map(|(_, i, _)| i)
+        .fold(None::<&Intent>, |best, i| match best {
+            Some(b) if b.category.restrictiveness() >= i.category.restrictiveness() => Some(b),
+            _ => Some(i),
+        })
+        .expect("at least two calls")
+        .clone();
+    intent.confidence = min_confidence;
+    (intent, decision)
+}
+
 /// SHA-256 over the RFC 8785 (JCS) canonical JSON of the tool calls.
 ///
 /// Key order and whitespace do not affect the digest, so a verifier can
 /// recompute it from the tool calls it actually receives.
+///
+/// RFC 8785 serialises numbers as IEEE-754 doubles, so integers beyond
+/// ±(2^53 − 1) would lose precision and two different ids could share a
+/// digest. Such integers are rejected with [`Error::Canonicalize`] here, so
+/// both issuing and verifying fail closed. Pass large ids as strings.
+/// Non-integer floats are allowed (their JCS form is exact for the double
+/// that serde_json parsed).
 pub fn tool_calls_digest(tool_calls: &[ToolCall]) -> Result<[u8; 32]> {
+    for call in tool_calls {
+        check_safe_integers(&call.arguments)?;
+    }
     let canonical =
         serde_jcs::to_vec(tool_calls).map_err(|e| Error::Canonicalize(e.to_string()))?;
     Ok(Sha256::digest(&canonical).into())
+}
+
+/// Largest integer magnitude a double represents exactly (2^53 − 1).
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+fn check_safe_integers(v: &serde_json::Value) -> Result<()> {
+    match v {
+        serde_json::Value::Number(n) => {
+            let unsafe_int = match (n.as_u64(), n.as_i64()) {
+                (Some(u), _) => u > MAX_SAFE_INTEGER,
+                (None, Some(i)) => i.unsigned_abs() > MAX_SAFE_INTEGER,
+                (None, None) => false, // a float
+            };
+            if unsafe_int {
+                return Err(Error::Canonicalize(format!(
+                    "integer {n} is outside ±(2^53 - 1); pass it as a string"
+                )));
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(a) => a.iter().try_for_each(check_safe_integers),
+        serde_json::Value::Object(o) => o.values().try_for_each(check_safe_integers),
+        _ => Ok(()),
+    }
 }
 
 /// Digest binding for an [`IntentRequest`]; covers its tool calls only, since
@@ -375,6 +498,68 @@ mod tests {
     }
 
     #[test]
+    fn digest_rejects_integers_beyond_double_precision() {
+        // These two would canonicalise to the same double and collide.
+        let a: serde_json::Value = serde_json::from_str(r#"{"id":9007199254740993}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{"id":9007199254740992}"#).unwrap();
+        assert!(matches!(
+            tool_calls_digest(&[call(a)]),
+            Err(Error::Canonicalize(_))
+        ));
+        assert!(matches!(
+            tool_calls_digest(&[call(b)]),
+            Err(Error::Canonicalize(_))
+        ));
+        let nested = json!({"x": [{"y": -9007199254740992i64}]});
+        assert!(tool_calls_digest(&[call(nested)]).is_err());
+        assert!(tool_calls_digest(&[call(json!({"id": u64::MAX}))]).is_err());
+        // The boundary itself and large ids as strings are fine.
+        assert!(tool_calls_digest(&[call(json!({"id": MAX_SAFE_INTEGER}))]).is_ok());
+        assert!(tool_calls_digest(&[call(json!({"id": -(MAX_SAFE_INTEGER as i64)}))]).is_ok());
+        assert!(tool_calls_digest(&[call(json!({"id": "9007199254740993"}))]).is_ok());
+        assert!(tool_calls_digest(&[call(json!({"x": 1.5e300}))]).is_ok());
+    }
+
+    #[test]
+    fn combine_decisions_strictest_wins() {
+        let allow = |s: &str, t| Decision::Allow {
+            scopes: vec![s.into()],
+            ttl: Duration::from_secs(t),
+        };
+        let deny = Decision::Deny {
+            reason: "no".into(),
+        };
+        let step = Decision::StepUp {
+            reason: "ask".into(),
+        };
+        let a1 = allow("b", 120);
+        let a2 = allow("a", 60);
+        assert_eq!(
+            combine_decisions([("x", &a1), ("y", &a2)]),
+            Decision::Allow {
+                scopes: vec!["a".into(), "b".into()],
+                ttl: Duration::from_secs(60)
+            }
+        );
+        assert_eq!(
+            combine_decisions([("x", &a1), ("y", &step)]),
+            Decision::StepUp {
+                reason: "y: ask".into()
+            }
+        );
+        assert_eq!(
+            combine_decisions([("x", &step), ("y", &deny), ("z", &a1)]),
+            Decision::Deny {
+                reason: "y: no".into()
+            }
+        );
+        assert!(matches!(
+            combine_decisions(std::iter::empty()),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn glob() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("delete_*", "delete_db"));
@@ -417,7 +602,7 @@ mod proptests {
         let leaf = prop_oneof![
             Just(Value::Null),
             any::<bool>().prop_map(Value::Bool),
-            any::<i64>().prop_map(Value::from),
+            (-(MAX_SAFE_INTEGER as i64)..=MAX_SAFE_INTEGER as i64).prop_map(Value::from),
             any::<f64>()
                 .prop_filter("finite", |f| f.is_finite())
                 .prop_map(Value::from),
@@ -514,7 +699,56 @@ mod proptests {
         }
     }
 
+    fn decision() -> impl Strategy<Value = Decision> {
+        prop_oneof![
+            (prop::collection::vec("[a-c]:[rw]", 1..3), 1u64..300).prop_map(|(scopes, t)| {
+                Decision::Allow {
+                    scopes,
+                    ttl: Duration::from_secs(t),
+                }
+            }),
+            "[a-z]{1,5}".prop_map(|reason| Decision::Deny { reason }),
+            "[a-z]{1,5}".prop_map(|reason| Decision::StepUp { reason }),
+        ]
+    }
+
+    fn rank(d: &Decision) -> u8 {
+        match d {
+            Decision::Allow { .. } => 0,
+            Decision::StepUp { .. } => 1,
+            Decision::Deny { .. } => 2,
+        }
+    }
+
     proptest! {
+        /// Across the full i64/u64 range, an integer is accepted exactly when
+        /// a double represents it, and accepted ones never collide.
+        #[test]
+        fn digest_integer_range(a in any::<i64>(), b in any::<u64>()) {
+            let da = tool_calls_digest(&[ToolCall { name: "t".into(), arguments: Value::from(a) }]);
+            prop_assert_eq!(da.is_ok(), a.unsigned_abs() <= MAX_SAFE_INTEGER);
+            let db = tool_calls_digest(&[ToolCall { name: "t".into(), arguments: Value::from(b) }]);
+            prop_assert_eq!(db.is_ok(), b <= MAX_SAFE_INTEGER);
+            if let (Ok(x), Ok(y)) = (da, db) {
+                prop_assert_eq!(x == y, a >= 0 && a as u64 == b);
+            }
+        }
+
+        /// Adding a call to a batch never makes the decision less restrictive.
+        #[test]
+        fn adding_a_call_never_relaxes_the_decision(
+            base in prop::collection::vec(decision(), 1..5),
+            extra in decision(),
+        ) {
+            let before = combine_decisions(base.iter().map(|d| ("t", d)));
+            let after = combine_decisions(base.iter().chain([&extra]).map(|d| ("t", d)));
+            prop_assert!(rank(&after) >= rank(&before));
+            if let (Decision::Allow { ttl: a, scopes: sa }, Decision::Allow { ttl: b, scopes: sb }) = (&after, &before) {
+                prop_assert!(a <= b);
+                prop_assert!(sb.iter().all(|s| sa.contains(s)));
+            }
+        }
+
         #[test]
         fn digest_ignores_object_key_order(
             calls in tool_calls(),

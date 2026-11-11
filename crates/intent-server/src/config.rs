@@ -1,5 +1,6 @@
 //! Server configuration (TOML) and API key handling.
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,32 @@ pub struct ServerConfig {
     /// Per-client rate limit for /v1/evaluate and /v1/verify. Absent = off.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Subject patterns each API key may request, keyed by the hex SHA-256
+    /// of the key (so no secret lives in this file). A key listed here gets
+    /// 403 for any other `subject`.
+    #[serde(default)]
+    pub subject_bindings: BTreeMap<String, Vec<String>>,
+    /// Reject keys that have no entry in `subject_bindings` (403). Without
+    /// it, unbound keys may still request any subject.
+    #[serde(default)]
+    pub require_subject_binding: bool,
+    /// Make `/v1/verify` single-use: the first successful verification of a
+    /// token consumes its `jti`, later ones get 401 `replayed`. In-memory and
+    /// per process. Off by default (the endpoint is stateless).
+    #[serde(default)]
+    pub verify_single_use: bool,
+    /// Maximum unexpired token ids remembered when `verify_single_use` is on.
+    /// When full, verification fails closed with 503.
+    #[serde(default = "default_replay_capacity")]
+    pub verify_replay_capacity: usize,
+    /// Require an API key for `/metrics`. Off by default: metrics are meant
+    /// for a private network or a scraper on the same host.
+    #[serde(default)]
+    pub metrics_require_auth: bool,
+}
+
+fn default_replay_capacity() -> usize {
+    100_000
 }
 
 /// Token-bucket rate limit: `burst` requests at once, refilled at
@@ -101,10 +128,13 @@ impl ServerConfig {
     }
 }
 
-/// SHA-256 digests of the accepted API keys.
+/// SHA-256 digests of the accepted API keys, plus optional per-key subject
+/// bindings.
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeys {
     digests: Vec<[u8; 32]>,
+    bindings: HashMap<[u8; 32], Vec<String>>,
+    require_binding: bool,
 }
 
 impl ApiKeys {
@@ -116,7 +146,38 @@ impl ApiKeys {
     pub fn from_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
             digests: keys.into_iter().map(digest).collect(),
+            ..Self::default()
         }
+    }
+
+    /// Binds keys (by hex SHA-256 digest) to the subject patterns they may
+    /// request. Every digest must belong to a configured key, so a typo
+    /// fails loudly instead of leaving a key unbound.
+    pub fn with_subject_bindings(
+        mut self,
+        bindings: &BTreeMap<String, Vec<String>>,
+        require_binding: bool,
+    ) -> Result<Self, Error> {
+        for (hex, patterns) in bindings {
+            let d = parse_hex_digest(hex).ok_or_else(|| {
+                Error::Config(format!(
+                    "subject_bindings: {hex:?} is not a 64-character hex SHA-256 digest"
+                ))
+            })?;
+            if !self.digests.contains(&d) {
+                return Err(Error::Config(format!(
+                    "subject_bindings: {hex} does not match any key in {API_KEYS_ENV}"
+                )));
+            }
+            if patterns.is_empty() {
+                return Err(Error::Config(format!(
+                    "subject_bindings: {hex} must list at least one subject pattern"
+                )));
+            }
+            self.bindings.insert(d, patterns.clone());
+        }
+        self.require_binding = require_binding;
+        Ok(self)
     }
 
     /// Reads [`API_KEYS_ENV`]; unset means no keys.
@@ -132,13 +193,39 @@ impl ApiKeys {
 
     /// Constant-time check of a presented key against every stored digest.
     pub fn check(&self, presented: &str) -> bool {
+        self.authenticate(presented).is_some()
+    }
+
+    /// Like [`check`](Self::check), returning the key's digest on success.
+    pub fn authenticate(&self, presented: &str) -> Option<[u8; 32]> {
         let d = digest(presented);
         let mut ok = subtle::Choice::from(0);
         for stored in &self.digests {
             ok |= stored.ct_eq(&d);
         }
-        ok.into()
+        bool::from(ok).then_some(d)
     }
+
+    /// Whether the key with this digest may request `subject`.
+    pub fn subject_allowed(&self, key: &[u8; 32], subject: &str) -> bool {
+        match self.bindings.get(key) {
+            Some(patterns) => patterns.iter().any(|p| intent_core::glob_match(p, subject)),
+            None => !self.require_binding,
+        }
+    }
+}
+
+fn parse_hex_digest(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |c: u8| (c as char).to_digit(16).map(|v| v as u8);
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks(2).enumerate() {
+        out[i] = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Some(out)
 }
 
 pub(crate) fn digest(key: &str) -> [u8; 32] {
@@ -155,6 +242,54 @@ mod tests {
         assert!(keys.check("a") && keys.check("b"));
         assert!(!keys.check("c") && !keys.check(""));
         assert!(ApiKeys::from_csv("").is_empty());
+    }
+
+    #[test]
+    fn subject_bindings() {
+        let hex = |k: &str| {
+            digest(k)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let mut map = BTreeMap::new();
+        map.insert(hex("svc"), vec!["svc-*".to_string()]);
+        let keys = ApiKeys::from_csv("svc,other")
+            .with_subject_bindings(&map, false)
+            .unwrap();
+        let svc = keys.authenticate("svc").unwrap();
+        let other = keys.authenticate("other").unwrap();
+        assert!(keys.subject_allowed(&svc, "svc-billing"));
+        assert!(!keys.subject_allowed(&svc, "user-42"));
+        assert!(keys.subject_allowed(&other, "anyone"));
+
+        let strict = ApiKeys::from_csv("svc,other")
+            .with_subject_bindings(&map, true)
+            .unwrap();
+        assert!(!strict.subject_allowed(&other, "anyone"));
+
+        // Typos and unknown keys fail loudly.
+        let mut bad = BTreeMap::new();
+        bad.insert("zz".to_string(), vec!["*".to_string()]);
+        assert!(
+            ApiKeys::from_csv("svc")
+                .with_subject_bindings(&bad, false)
+                .is_err()
+        );
+        let mut unknown = BTreeMap::new();
+        unknown.insert(hex("nope"), vec!["*".to_string()]);
+        assert!(
+            ApiKeys::from_csv("svc")
+                .with_subject_bindings(&unknown, false)
+                .is_err()
+        );
+        let mut empty = BTreeMap::new();
+        empty.insert(hex("svc"), vec![]);
+        assert!(
+            ApiKeys::from_csv("svc")
+                .with_subject_bindings(&empty, false)
+                .is_err()
+        );
     }
 
     #[test]

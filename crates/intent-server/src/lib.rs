@@ -20,13 +20,17 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use intent_classify::{DEFAULT_THRESHOLD, HybridClassifier, RuleClassifier};
 use intent_core::{
-    Decision, Evaluator, IntentClassifier, IntentRequest, ToolCall, encode_digest, request_digest,
+    ClassifierSource, Decision, Evaluation, Evaluator, Intent, IntentCategory, IntentClassifier,
+    IntentRequest, ToolCall, encode_digest, request_digest,
 };
 use intent_policy::Policy;
-use intent_token::{IssuerConfig, Jwk, Jwks, JwtIssuer, KeyPair, TokenError, TokenVerifier};
+use intent_token::{
+    InMemoryReplayStore, IssuerConfig, Jwk, Jwks, JwtIssuer, KeyPair, ReplayError, ReplayStore,
+    TokenError, TokenVerifier,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::timeout::TimeoutLayer;
@@ -40,6 +44,12 @@ pub use reload::{ReloadGuard, spawn_reload_triggers};
 
 /// Per-request timeout.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default time allowed for classification and policy in `/v1/evaluate`.
+/// Kept below [`REQUEST_TIMEOUT`] so a slow LLM fallback (retries included,
+/// and once per tool call in a batch) ends in a fail-closed deny rather than
+/// a 408 from the outer timeout.
+pub const EVALUATE_BUDGET: Duration = Duration::from_secs(25);
 
 /// Errors while building the server state.
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +172,10 @@ pub struct AppState {
     require_auth: bool,
     max_body_bytes: usize,
     rate_limiter: Option<Arc<KeyedLimiter>>,
+    /// When set, `/v1/verify` consumes each token's `jti` (single use).
+    replay: Option<Arc<dyn ReplayStore>>,
+    evaluate_budget: Duration,
+    metrics_require_auth: bool,
     metrics: Option<Metrics>,
 }
 
@@ -188,6 +202,14 @@ impl AppState {
         if let Some(rl) = &config.rate_limit {
             rl.validate()?;
         }
+        if !require_auth && config.require_subject_binding {
+            return Err(Error::Config(
+                "require_subject_binding needs API keys; it cannot apply when unauthenticated"
+                    .into(),
+            ));
+        }
+        let api_keys = api_keys
+            .with_subject_bindings(&config.subject_bindings, config.require_subject_binding)?;
         let snapshot = Snapshot::from_config(config)?;
         Ok(Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
@@ -196,6 +218,12 @@ impl AppState {
             require_auth,
             max_body_bytes: config.max_body_bytes,
             rate_limiter: config.rate_limit.map(|c| Arc::new(KeyedLimiter::new(c))),
+            evaluate_budget: EVALUATE_BUDGET,
+            metrics_require_auth: config.metrics_require_auth,
+            replay: config.verify_single_use.then(|| {
+                Arc::new(InMemoryReplayStore::new(config.verify_replay_capacity))
+                    as Arc<dyn ReplayStore>
+            }),
             metrics,
         })
     }
@@ -226,8 +254,25 @@ impl AppState {
             api_keys: Arc::new(api_keys),
             max_body_bytes: 256 * 1024,
             rate_limiter: None,
+            replay: None,
+            evaluate_budget: EVALUATE_BUDGET,
+            metrics_require_auth: false,
             metrics,
         })
+    }
+
+    /// Makes `/v1/verify` single-use: each token's `jti` is consumed on the
+    /// first successful verification. Clones of the state share the store.
+    pub fn with_replay_store(mut self, store: Arc<dyn ReplayStore>) -> Self {
+        self.replay = Some(store);
+        self
+    }
+
+    /// Overrides [`EVALUATE_BUDGET`]. Values at or above [`REQUEST_TIMEOUT`]
+    /// are capped just below it.
+    pub fn with_evaluate_budget(mut self, budget: Duration) -> Self {
+        self.evaluate_budget = budget.min(REQUEST_TIMEOUT - Duration::from_secs(1));
+        self
     }
 
     pub fn with_max_body_bytes(mut self, max: usize) -> Self {
@@ -311,11 +356,20 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
+    // /metrics is public by default (expected behind a private network);
+    // `metrics_require_auth` puts it behind the API key check.
+    let metrics_route = Router::new().route("/metrics", get(metrics_text));
+    let metrics_route = if state.metrics_require_auth {
+        metrics_route.route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
+    } else {
+        metrics_route
+    };
+
     Router::new()
         .merge(protected)
+        .merge(metrics_route)
         .route("/.well-known/jwks.json", get(jwks))
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics_text))
         .layer(DefaultBodyLimit::max(state.max_body_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -339,10 +393,18 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-api-key").and_then(|v| v.to_str().ok())
 }
 
-async fn authenticate(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if state.require_auth && !presented_key(req.headers()).is_some_and(|k| state.api_keys.check(k))
-    {
-        return ApiError::Unauthorized.into_response();
+/// SHA-256 of the API key that authenticated this request.
+#[derive(Clone, Copy)]
+struct AuthedKey([u8; 32]);
+
+async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if state.require_auth {
+        match presented_key(req.headers()).and_then(|k| state.api_keys.authenticate(k)) {
+            Some(d) => {
+                req.extensions_mut().insert(AuthedKey(d));
+            }
+            None => return ApiError::Unauthorized.into_response(),
+        }
     }
     next.run(req).await
 }
@@ -375,6 +437,10 @@ async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> 
 enum ApiError {
     Unauthorized,
     RateLimited(Duration),
+    /// The request body is well-formed JSON but cannot be processed.
+    BadRequest(String),
+    /// Authenticated, but this key may not request that subject.
+    SubjectNotAllowed,
     Internal,
 }
 
@@ -404,6 +470,16 @@ impl IntoResponse for ApiError {
                     .insert(header::RETRY_AFTER, secs.max(1).into());
                 res
             }
+            Self::BadRequest(detail) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_request", "detail": detail})),
+            )
+                .into_response(),
+            Self::SubjectNotAllowed => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "subject_not_allowed"})),
+            )
+                .into_response(),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "internal error"})),
@@ -417,20 +493,54 @@ impl IntoResponse for ApiError {
 
 async fn evaluate(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthedKey>>,
     Json(req): Json<IntentRequest>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
+    if let Some(Extension(AuthedKey(key))) = auth
+        && !state.api_keys.subject_allowed(&key, &req.subject)
+    {
+        tracing::info!(
+            target: "intent::audit",
+            subject = %req.subject,
+            decision = "subject_not_allowed",
+            "evaluate"
+        );
+        return Err(ApiError::SubjectNotAllowed);
+    }
     let snap = state.snapshot.load_full();
-    let evaluation = snap.evaluator.evaluate(&req).await.map_err(|e| {
-        tracing::error!(target: "intent::server", error = %e, "evaluation failed");
-        ApiError::Internal
-    })?;
+    // Digest first: a request that cannot be bound to a token (e.g. an
+    // integer beyond double precision) is the caller's error, not ours.
     let req_hash = request_digest(&req)
         .map(|d| encode_digest(&d))
-        .map_err(|e| {
-            tracing::error!(target: "intent::server", error = %e, "request digest failed");
-            ApiError::Internal
-        })?;
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let evaluation =
+        match tokio::time::timeout(state.evaluate_budget, snap.evaluator.evaluate(&req)).await {
+            Ok(result) => result.map_err(|e| {
+                tracing::error!(target: "intent::server", error = %e, "evaluation failed");
+                ApiError::Internal
+            })?,
+            Err(_) => {
+                tracing::warn!(
+                    target: "intent::audit",
+                    budget_ms = state.evaluate_budget.as_millis() as u64,
+                    "evaluation exceeded its time budget; failing closed"
+                );
+                Evaluation {
+                    intent: Intent {
+                        category: IntentCategory::Unknown,
+                        action: "classification_timed_out".into(),
+                        resource: None,
+                        confidence: 0.0,
+                        source: ClassifierSource::Hybrid,
+                    },
+                    decision: Decision::Deny {
+                        reason: "classification timed out".into(),
+                    },
+                    token: None,
+                }
+            }
+        };
 
     let (name, status, reason) = match &evaluation.decision {
         Decision::Allow { .. } => ("allow", StatusCode::OK, None),
@@ -483,6 +593,31 @@ async fn verify(State(state): State<AppState>, Json(req): Json<VerifyRequest>) -
         .verify(&req.token, &req.tool_calls, req.scope.as_deref())
     {
         Ok(claims) => {
+            // Consume the jti last, after every other check passed, so an
+            // invalid request cannot burn a good token.
+            if let Some(store) = &state.replay
+                && let Err(e) = store.check_and_insert(&claims.jti, claims.exp)
+            {
+                let (status, error) = match e {
+                    ReplayError::Replayed => (StatusCode::UNAUTHORIZED, "replayed"),
+                    ReplayError::Full | ReplayError::Backend(_) => {
+                        tracing::error!(target: "intent::server", detail = %e, "replay store unavailable; failing closed");
+                        (StatusCode::SERVICE_UNAVAILABLE, "replay_store_unavailable")
+                    }
+                };
+                tracing::info!(target: "intent::audit", result = "invalid", error, jti = %claims.jti, "verify");
+                if let Some(m) = &state.metrics {
+                    m.record_verification("invalid");
+                }
+                return (
+                    status,
+                    Json(VerifyError {
+                        valid: false,
+                        error,
+                    }),
+                )
+                    .into_response();
+            }
             tracing::info!(
                 target: "intent::audit",
                 result = "valid",

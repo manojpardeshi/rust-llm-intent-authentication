@@ -1,2 +1,4 @@
 target
 *.key.json
+jwks.json
+eval.json

@@ -68,3 +68,29 @@ watch = false
 # [rate_limit]
 # per_second = 20
 # burst = 40
+
+# --- Subject binding -----------------------------------------------------
+# By default the `subject` in a request body is whatever the caller says.
+# Bind API keys to the subjects they may request, keyed by the key's hex
+# SHA-256 (so no secret lives here):
+#   printf %s 'the-api-key' | shasum -a 256
+# A bound key gets 403 {"error":"subject_not_allowed"} for other subjects.
+# require_subject_binding = true also rejects keys that have no entry.
+# Every listed digest must match a key in INTENT_API_KEYS. Not reloadable.
+# require_subject_binding = false
+# [subject_bindings]
+# "8d50189b762a2ceb6ce62f175bdeed3b98da57133c8486a27d65fd5c8ece164f" = ["user-*"]
+
+# --- /v1/verify replay protection ----------------------------------------
+# /v1/verify is stateless by default: the same token verifies until it
+# expires. With verify_single_use = true, the first successful verification
+# consumes the token's jti and later ones get 401 {"error":"replayed"}.
+# The store is in memory and per process; when full it fails closed (503).
+# Gateways written in Rust can use intent-verifier's replay store instead.
+# verify_single_use = false
+# verify_replay_capacity = 100000
+
+# --- Metrics -------------------------------------------------------------
+# /metrics is public by default (intended for a private network). Set this to
+# require an API key for it as well.
+# metrics_require_auth = false

@@ -59,6 +59,10 @@ pub struct ToolRule {
     /// Regexes that named string arguments must all match for this rule to apply.
     #[serde(default)]
     pub args_match: BTreeMap<String, String>,
+    /// Regexes that named string arguments must NOT match for this rule to
+    /// apply. A missing argument counts as not matching.
+    #[serde(default)]
+    pub args_not_match: BTreeMap<String, String>,
 }
 
 fn yes() -> bool {
@@ -72,18 +76,52 @@ fn default_confidence() -> f32 {
 struct CompiledToolRule {
     rule: ToolRule,
     args_match: Vec<(String, Regex)>,
+    args_not_match: Vec<(String, Regex)>,
+}
+
+/// Outcome of testing one rule against one call.
+enum RuleMatch {
+    Yes,
+    No,
+    /// The tool name matched but an argument the rule inspects is present
+    /// and not a string, so the rule cannot decide. The call is classified
+    /// `Unknown` instead of falling through to a later (possibly laxer) rule.
+    Undecidable,
 }
 
 impl CompiledToolRule {
-    fn matches(&self, call: &ToolCall) -> bool {
-        glob_match(&self.rule.name, &call.name)
-            && self.args_match.iter().all(|(arg, re)| {
-                call.arguments
-                    .get(arg)
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| re.is_match(s))
-            })
+    fn matches(&self, call: &ToolCall) -> RuleMatch {
+        if !glob_match(&self.rule.name, &call.name) {
+            return RuleMatch::No;
+        }
+        let mut all = true;
+        for (arg, re, want) in self
+            .args_match
+            .iter()
+            .map(|(a, r)| (a, r, true))
+            .chain(self.args_not_match.iter().map(|(a, r)| (a, r, false)))
+        {
+            match call.arguments.get(arg) {
+                None => all &= !want,
+                Some(serde_json::Value::String(s)) => all &= re.is_match(s) == want,
+                Some(_) => return RuleMatch::Undecidable,
+            }
+        }
+        if all { RuleMatch::Yes } else { RuleMatch::No }
     }
+}
+
+fn compile_args(
+    rule_no: usize,
+    args: &BTreeMap<String, String>,
+) -> Result<Vec<(String, Regex)>, ClassifyError> {
+    args.iter()
+        .map(|(arg, pat)| {
+            Regex::new(pat)
+                .map(|re| (arg.clone(), re))
+                .map_err(|e| ClassifyError::Config(format!("tool rule {rule_no}: {e}")))
+        })
+        .collect()
 }
 
 /// Classifies requests by tool name/argument rules and injection signatures.
@@ -116,16 +154,13 @@ impl RuleClassifier {
                         i + 1
                     )));
                 }
-                let args_match = rule
-                    .args_match
-                    .iter()
-                    .map(|(arg, pat)| {
-                        Regex::new(pat)
-                            .map(|re| (arg.clone(), re))
-                            .map_err(|e| ClassifyError::Config(format!("tool rule {}: {e}", i + 1)))
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(CompiledToolRule { rule, args_match })
+                let args_match = compile_args(i + 1, &rule.args_match)?;
+                let args_not_match = compile_args(i + 1, &rule.args_not_match)?;
+                Ok(CompiledToolRule {
+                    rule,
+                    args_match,
+                    args_not_match,
+                })
             })
             .collect::<Result<_, _>>()?;
 
@@ -158,7 +193,18 @@ impl RuleClassifier {
         let mut best: Option<Intent> = None;
         let mut min_confidence = 1.0f32;
         for call in &request.tool_calls {
-            let Some(rule) = self.tools.iter().find(|r| r.matches(call)).map(|r| &r.rule) else {
+            let mut found = None;
+            for r in &self.tools {
+                match r.matches(call) {
+                    RuleMatch::Yes => {
+                        found = Some(&r.rule);
+                        break;
+                    }
+                    RuleMatch::No => {}
+                    RuleMatch::Undecidable => break,
+                }
+            }
+            let Some(rule) = found else {
                 return intent(IntentCategory::Unknown, &call.name, None, 0.0);
             };
             min_confidence = min_confidence.min(rule.confidence);
@@ -398,6 +444,95 @@ mod tests {
             RuleClassifier::from_toml_str("[[tool]]\nname = \"x\"\ncategory = \"Nope\"").is_err()
         );
     }
+    /// IMPROVEMENTS 1.2, against the shipped example rules.
+    fn example_rules() -> RuleClassifier {
+        RuleClassifier::from_toml_str(include_str!("../../../config/rules.example.toml")).unwrap()
+    }
+
+    #[test]
+    fn example_rules_classify_disguised_sql_writes_as_writes() {
+        let c = example_rules();
+        for q in [
+            "WITH x AS (SELECT 1) DELETE FROM users",
+            "select 1; drop table users",
+            "/**/drop table users",
+            "select 1 -- \n; drop table users",
+            "SELECT * INTO backup FROM users",
+            "select * from users for update",
+            "DELETE FROM users",
+            "",
+        ] {
+            let i = c.classify_sync(&req(vec![("run_sql", json!({ "query": q }))], &[]));
+            assert_eq!(
+                (i.category, i.action.as_str()),
+                (IntentCategory::WriteData, "sql_write"),
+                "{q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn example_rules_accept_plain_selects_as_reads() {
+        let c = example_rules();
+        for q in [
+            "SELECT count(*) FROM users",
+            "  select a, b from t where c = 'x';  ",
+            "select name\nfrom users\nwhere id = 1",
+        ] {
+            let i = c.classify_sync(&req(vec![("run_sql", json!({ "query": q }))], &[]));
+            assert_eq!(
+                (i.category, i.action.as_str()),
+                (IntentCategory::ReadData, "sql_read"),
+                "{q:?}"
+            );
+            assert_eq!(i.confidence, 0.8);
+        }
+    }
+
+    #[test]
+    fn non_string_inspected_argument_is_unknown_not_fallthrough() {
+        let c = example_rules();
+        for q in [
+            json!(["select 1"]),
+            json!({"sql": "drop table t"}),
+            json!(1),
+        ] {
+            let i = c.classify_sync(&req(vec![("run_sql", json!({ "query": q }))], &[]));
+            assert_eq!(i.category, IntentCategory::Unknown, "{q}");
+            assert_eq!(i.confidence, 0.0);
+        }
+        // A missing argument just fails the rule, so the next one applies.
+        let i = c.classify_sync(&req(vec![("run_sql", json!({}))], &[]));
+        assert_eq!(i.action, "sql_write");
+    }
+
+    #[test]
+    fn args_not_match_excludes_rule() {
+        let c = RuleClassifier::from_toml_str(
+            r#"
+            [[tool]]
+            name = "fetch"
+            category = "ReadData"
+            args_not_match = { url = "^http:" }
+            [[tool]]
+            name = "fetch"
+            category = "SendMessage"
+            "#,
+        )
+        .unwrap();
+        let get = |url: &str| {
+            c.classify_sync(&req(vec![("fetch", json!({ "url": url }))], &[]))
+                .category
+        };
+        assert_eq!(get("https://a"), IntentCategory::ReadData);
+        assert_eq!(get("http://a"), IntentCategory::SendMessage);
+        assert!(
+            RuleClassifier::from_toml_str(
+                "[[tool]]\nname = \"x\"\ncategory = \"ReadData\"\nargs_not_match = { a = \"(\" }"
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +634,7 @@ mod proptests {
                     resource_arg: None,
                     confidence,
                     args_match: BTreeMap::new(),
+                    args_not_match: BTreeMap::new(),
                 }],
             };
             // Out-of-range confidences are rejected at construction.

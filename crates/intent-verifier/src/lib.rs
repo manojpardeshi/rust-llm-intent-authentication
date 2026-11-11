@@ -18,7 +18,6 @@
 
 mod error;
 mod remote;
-mod replay;
 
 #[cfg(feature = "axum")]
 mod middleware;
@@ -31,8 +30,8 @@ use intent_token::{Claims, Jwks, TokenError, TokenVerifier};
 use tokio::sync::Mutex;
 
 pub use error::VerifyError;
+pub use intent_token::{InMemoryReplayStore, ReplayError, ReplayStore};
 pub use remote::RemoteJwksOptions;
-pub use replay::{InMemoryReplayStore, ReplayError, ReplayStore};
 
 #[cfg(feature = "axum")]
 pub use middleware::{IntentLayer, IntentService, VerifiedIntent, VerifiedToolCalls};

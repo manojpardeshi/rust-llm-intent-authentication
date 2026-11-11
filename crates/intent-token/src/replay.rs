@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Seconds past `exp` that intent-token's verifier still accepts a token.
+/// Seconds past `exp` that the token verifier still accepts a token.
 /// Entries must outlive that window or an expiring token could be replayed.
-const LEEWAY: i64 = 5;
+const LEEWAY: i64 = crate::LEEWAY_SECS as i64;
 
 /// How often (seconds) an insert also sweeps expired entries, so memory stays
 /// bounded by live tokens even when the store is never near capacity.

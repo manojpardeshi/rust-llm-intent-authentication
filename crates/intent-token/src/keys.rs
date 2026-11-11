@@ -10,10 +10,13 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::TokenError;
 
-/// An Ed25519 key pair identified by a `kid`.
+/// An Ed25519 key pair identified by a `kid`. The signing key is zeroised
+/// on drop (ed25519-dalek's `zeroize` feature), as are the intermediate
+/// seed, DER and key-file buffers.
 pub struct KeyPair {
     kid: String,
     signing_key: SigningKey,
@@ -31,13 +34,18 @@ impl std::fmt::Debug for KeyPair {
 impl KeyPair {
     /// Generates a new key from the OS RNG.
     pub fn generate() -> Result<Self, TokenError> {
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|e| TokenError::Key(e.to_string()))?;
-        Ok(Self::from_seed(seed))
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::fill(seed.as_mut()).map_err(|e| TokenError::Key(e.to_string()))?;
+        Ok(Self::from_seed_ref(&seed))
     }
 
     pub fn from_seed(seed: [u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(&seed);
+        let seed = Zeroizing::new(seed);
+        Self::from_seed_ref(&seed)
+    }
+
+    fn from_seed_ref(seed: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(seed);
         let kid = thumbprint(&public_x(&signing_key));
         Self { kid, signing_key }
     }
@@ -62,10 +70,10 @@ impl KeyPair {
         }
     }
 
-    pub(crate) fn pkcs8_der(&self) -> Result<Vec<u8>, TokenError> {
+    pub(crate) fn pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>, TokenError> {
         self.signing_key
             .to_pkcs8_der()
-            .map(|doc| doc.as_bytes().to_vec())
+            .map(|doc| Zeroizing::new(doc.as_bytes().to_vec()))
             .map_err(|e| TokenError::Key(e.to_string()))
     }
 
@@ -74,10 +82,14 @@ impl KeyPair {
         let file = KeyFile {
             kid: self.kid.clone(),
             alg: "EdDSA".into(),
-            d: URL_SAFE_NO_PAD.encode(self.signing_key.to_bytes()),
+            d: Zeroizing::new(
+                URL_SAFE_NO_PAD.encode(Zeroizing::new(self.signing_key.to_bytes()).as_ref()),
+            ),
             x: self.public_x(),
         };
-        let json = serde_json::to_vec_pretty(&file).map_err(|e| TokenError::Key(e.to_string()))?;
+        let json = Zeroizing::new(
+            serde_json::to_vec_pretty(&file).map_err(|e| TokenError::Key(e.to_string()))?,
+        );
 
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -90,19 +102,25 @@ impl KeyPair {
             .open(path)
             .map_err(|e| TokenError::Key(e.to_string()))?;
         f.write_all(&json)
-            .map_err(|e| TokenError::Key(e.to_string()))
+            .map_err(|e| TokenError::Key(e.to_string()))?;
+        // Make sure the key is on disk before reporting success.
+        f.sync_all().map_err(|e| TokenError::Key(e.to_string()))
     }
 
     pub fn load(path: &Path) -> Result<Self, TokenError> {
-        let bytes = fs::read(path).map_err(|e| TokenError::Key(e.to_string()))?;
+        let bytes = Zeroizing::new(fs::read(path).map_err(|e| TokenError::Key(e.to_string()))?);
         let file: KeyFile =
             serde_json::from_slice(&bytes).map_err(|e| TokenError::Key(e.to_string()))?;
-        let seed: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(&file.d)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| TokenError::Key("invalid private key encoding".into()))?;
-        let key = Self::from_seed(seed);
+        let decoded = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(file.d.as_bytes())
+                .map_err(|_| TokenError::Key("invalid private key encoding".into()))?,
+        );
+        let seed: &[u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| TokenError::Key("invalid private key encoding".into()))?;
+        let key = Self::from_seed_ref(seed);
         if key.kid != file.kid || key.public_x() != file.x {
             return Err(TokenError::Key(
                 "key file kid/x do not match private key".into(),
@@ -116,7 +134,7 @@ impl KeyPair {
 struct KeyFile {
     kid: String,
     alg: String,
-    d: String,
+    d: Zeroizing<String>,
     x: String,
 }
 

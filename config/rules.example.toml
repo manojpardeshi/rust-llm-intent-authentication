@@ -1,8 +1,11 @@
 # Classifier rules: map tool calls to intents, and flag prompt injection.
 #
 # Tool rules are tried in order; the first whose `name` (exact, `prefix*`, or
-# `*`) and every `args_match` regex match wins. Unmatched tools classify as
-# Unknown with zero confidence, so the LLM fallback (or a policy deny) decides.
+# `*`) matches, whose every `args_match` regex matches and none of whose
+# `args_not_match` regexes match wins. If an argument a rule inspects is
+# present but not a string, the call is classified Unknown (no fallthrough).
+# Unmatched tools classify as Unknown with zero confidence, so the LLM
+# fallback (or a policy deny) decides.
 
 # Built-in injection signatures (see DEFAULT_INJECTION_PATTERNS) stay on unless disabled.
 use_default_injection_patterns = true
@@ -22,19 +25,23 @@ name = "search_*"
 category = "ReadData"
 confidence = 0.9
 
-# Writes take precedence over reads for the same tool, so list them first.
-[[tool]]
-name = "run_sql"
-category = "WriteData"
-action = "sql_write"
-args_match = { query = "(?i)^\\s*(insert|update|delete|drop|alter|truncate|create)\\b" }
-
+# SQL: only a positively recognised single SELECT is a read. Everything else
+# (CTEs, multiple statements, comments, SELECT ... INTO, locking reads) is
+# treated as a write, which the example policy sends to step-up. A non-string
+# query is Unknown, which the policy denies. Allow-listing reads is safer than deny-listing writes.
 [[tool]]
 name = "run_sql"
 category = "ReadData"
 action = "sql_read"
-# Not every non-write SQL is a pure read; let the LLM confirm.
-confidence = 0.7
+confidence = 0.8
+args_match = { query = "(?is)^\\s*select\\b" }
+# Reject: a second statement, comments, writes hidden in a SELECT.
+args_not_match = { query = "(?is)(;\\s*\\S|--|/\\*|#|\\binto\\b|\\bfor\\s+(update|share|no\\s+key\\s+update)\\b|\\b(pg_sleep|lo_import|lo_export|load_file|xp_cmdshell|dblink)\\b)" }
+
+[[tool]]
+name = "run_sql"
+category = "WriteData"
+action = "sql_write"
 
 # --- Writes ----------------------------------------------------------------
 

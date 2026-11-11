@@ -497,3 +497,51 @@ async fn rate_limit_unauthenticated_mode_keys_by_client_ip() {
     );
     assert_eq!(call(&app, req).await.0, StatusCode::TOO_MANY_REQUESTS);
 }
+
+// --- evaluate time budget -------------------------------------------------
+
+struct SlowClassifier;
+
+#[async_trait::async_trait]
+impl intent_core::IntentClassifier for SlowClassifier {
+    async fn classify(
+        &self,
+        _: &intent_core::IntentRequest,
+    ) -> intent_core::Result<intent_core::Intent> {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        unreachable!("the budget should have expired first")
+    }
+}
+
+/// IMPROVEMENTS 3 (timeout mismatch): a classifier slower than the budget
+/// yields a fail-closed deny, not a 408 from the outer request timeout.
+#[tokio::test]
+async fn slow_classification_fails_closed_within_budget() {
+    use std::sync::Arc;
+    let key = KeyPair::generate().unwrap();
+    let issuer = intent_token::JwtIssuer::new(
+        intent_token::IssuerConfig::new("intent-server", "tool-gateway"),
+        &key,
+    )
+    .unwrap();
+    let jwks = issuer.jwks();
+    let policy =
+        intent_policy::Policy::from_path(&root().join("config/policy.example.toml")).unwrap();
+    let state = AppState::new(
+        intent_core::Evaluator::new(Arc::new(SlowClassifier), Arc::new(policy), Arc::new(issuer)),
+        &jwks,
+        "intent-server",
+        "tool-gateway",
+        ApiKeys::from_csv(KEY),
+        None,
+    )
+    .unwrap()
+    .with_evaluate_budget(Duration::from_millis(100));
+    let started = Instant::now();
+    let (s, b) = evaluate(&router(state)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    assert_eq!(b["decision"], "deny");
+    assert_eq!(b["intent"]["action"], "classification_timed_out");
+    assert!(b.get("token").is_none());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
